@@ -24,13 +24,8 @@ class ResumeService:
                 detail="rawText must be at least 50 characters long"
             )
 
-        model_name = os.getenv("MODEL_NAME") or MODEL_NAME
-        api_key = (
-            os.getenv("GEMINI_API_KEY")
-            or GEMINI_API_KEY
-            or os.getenv("OPENAI_API_KEY")
-            or OPENAI_API_KEY
-        )
+        model_name = os.getenv("MODEL_NAME", MODEL_NAME)
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise HTTPException(
                 status_code=502,

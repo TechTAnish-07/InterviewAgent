@@ -5,7 +5,7 @@ Standalone Python FastAPI service scoped to resume text normalization.
 ## Project Structure
 
 ```
-python-agent/
+.
 ├── app/
 │   ├── controllers/          # Endpoint Controllers / Routers
 │   │   ├── health_controller.py
@@ -35,17 +35,18 @@ source venv/bin/activate
 
 ### 2. Install Dependencies
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 ### 3. Environment Configuration
-Copy `.env.example` to `.env` and set your OpenAI API key:
+Copy `.env.example` to `.env` and set your API key:
 ```bash
 cp .env.example .env
 ```
 Update `.env`:
 ```env
-OPENAI_API_KEY=your_openai_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+MODEL_NAME=gemini/gemini-2.0-flash
 PORT=8000
 ```
 
