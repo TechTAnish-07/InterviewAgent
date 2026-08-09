@@ -3,7 +3,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from app.controllers import health_controller, resume_controller
+from app.controllers import health_controller, resume_controller, dispatch_controller
 
 logger = logging.getLogger("uvicorn")
 
@@ -39,3 +39,4 @@ app = FastAPI(
 
 app.include_router(health_controller.router)
 app.include_router(resume_controller.router)
+app.include_router(dispatch_controller.router)
