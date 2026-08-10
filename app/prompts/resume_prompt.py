@@ -13,3 +13,16 @@ Rules:
   (e.g. group a company name with its own dates and bullet points), but never
   change or add facts.
 - Output ONLY the markdown. No preamble, no explanation."""
+
+RESUME_RELEVANCE_CHECK_PROMPT = """You are screening whether a candidate's resume is relevant to a job role before an interview begins.
+
+Job role: {job_title}
+Resume:
+{resume_text}
+
+Assess whether this resume shows relevant experience, skills, or background for this job role. Respond in this exact format, nothing else:
+RELEVANT: YES or NO
+REASON: one short sentence explaining why, written for the candidate to read directly
+  (e.g. "Your resume shows strong backend experience, which aligns well with this role."
+  or "Your resume is focused on marketing, which doesn't closely match this technical role.")"""
+

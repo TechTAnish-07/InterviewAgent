@@ -7,3 +7,14 @@ class ResumeNormalizeRequest(BaseModel):
 
 class ResumeNormalizeResponse(BaseModel):
     cleanedText: str
+
+
+class ResumeCheckRelevanceRequest(BaseModel):
+    resumeText: str
+    jobTitle: str
+
+
+class ResumeCheckRelevanceResponse(BaseModel):
+    relevant: bool
+    reason: str
+
