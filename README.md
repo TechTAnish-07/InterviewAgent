@@ -1,34 +1,64 @@
-# Resume Normalization Agent API
+# 🤖 AI Voice Interview Agent & Resume Service
 
-Standalone Python FastAPI service scoped to resume text normalization.
+Standalone Python service containing:
+1. **LiveKit AI Voice Agent Worker (`agent.py`)** — Full-duplex conversational interviewer.
+2. **FastAPI Microservice (`app/`)** — Resume normalization, pre-flight relevance screening, and agent dispatch.
 
-## Project Structure
+---
+
+## 🚀 Features & Architecture
+
+### 🎙️ LiveKit AI Voice Agent (`agent.py`)
+- **Full-Duplex Speech Pipeline**:
+  - **VAD (Voice Activity Detection)**: Local Silero VAD for low-latency speech detection.
+  - **STT (Speech-to-Text)**: Groq hosted Whisper (`whisper-large-v3`).
+  - **LLM**: Gemini / OpenAI via LiteLLM (`gemini-2.5-flash`).
+  - **TTS (Text-to-Speech)**: Fish Audio model (`fishaudio/s2.1-pro-free`).
+- **Bounded Working Memory (`memory.py`)**:
+  - Maintains a sliding window of recent conversation turns and automatically folds older exchanges into a rolling summary.
+- **Moderation & Warning Escalation (`moderation.py`)**:
+  - Screens candidate turns for off-topic or inappropriate content.
+  - Escalates through soft warnings before terminating policy-violating sessions.
+- **Automated Feedback Generation**:
+  - Generates comprehensive post-interview evaluation reports and posts them to the Spring Boot backend (`POST /api/ai-interview/{sessionId}/feedback`).
+
+### ⚡ FastAPI Microservice (`app/`)
+- **`POST /resume/normalize`**: Reconstructs scrambled raw PDF resume text into clean, structured Markdown.
+- **`POST /resume/check-relevance`**: Evaluates candidate resumes against target job titles before launching an interview session.
+- **`POST /dispatch-agent`**: Dispatches the `interview-agent` worker to LiveKit rooms using the LiveKit Admin SDK.
+
+---
+
+## 📁 Project Structure
 
 ```
-.
+InterviewAgent/
 ├── app/
 │   ├── controllers/          # Endpoint Controllers / Routers
 │   │   ├── health_controller.py
-│   │   └── resume_controller.py
-│   ├── schemas/              # Request / Response Schemas
+│   │   ├── resume_controller.py
+│   │   └── dispatch_controller.py
+│   ├── schemas/              # Pydantic Schemas
 │   │   └── resume_schema.py
-│   ├── services/             # Business Logic & LLM Services
+│   ├── services/             # Resume Normalization & Relevance LLM Service
 │   │   └── resume_service.py
-│   ├── config.py             # System Configurations & Prompts
-│   └── main.py               # FastAPI App Initializer
-├── agent.py                  # LiveKit Voice Agent Worker (VAD + STT)
-├── main.py                   # Root entrypoint exporting app
+│   ├── config.py
+│   └── main.py               # FastAPI App Entrypoint
+├── agent.py                  # LiveKit Voice Agent Worker
+├── memory.py                 # Bounded Conversation Memory & Summarization
+├── moderation.py             # Off-topic & Inappropriate Input Moderation
+├── prompts.py                # System Prompts & Feedback Generation Prompts
+├── tools.py                  # Agent Tool Call Definitions
 ├── requirements.txt          # Dependencies
-├── .env.example              # Environment variables template
-├── .env                      # Local environment configuration
-├── .gitignore                # Git ignore rules
-├── test_main.py              # Unit tests suite
-└── README.md                 # Documentation
+├── test_main.py              # Pytest Unit Test Suite
+└── README.md
 ```
 
-## Setup & Running
+---
 
-### 1. Create and Activate Virtual Environment
+## ⚙️ Setup & Running
+
+### 1. Create & Activate Virtual Environment
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -36,69 +66,53 @@ source venv/bin/activate
 
 ### 2. Install Dependencies
 ```bash
-python3 -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 3. Environment Configuration
-Copy `.env.example` to `.env` and set your API keys:
-```bash
-cp .env.example .env
-```
-Update `.env`:
+Create a `.env` file from `.env.example`:
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
-MODEL_NAME=gemini/gemini-2.0-flash
+GEMINI_API_KEY=your_gemini_api_key
+OPENAI_API_KEY=your_openai_api_key
+MODEL_NAME=gemini/gemini-2.5-flash
 PORT=8000
 LIVEKIT_URL=ws://127.0.0.1:7880
 LIVEKIT_API_KEY=devkey
 LIVEKIT_API_SECRET=secret
-GROQ_API_KEY=your_groq_api_key_here
+GROQ_API_KEY=your_groq_api_key
+SPRING_BASE_URL=http://localhost:8080
+INTERNAL_SERVICE_API_KEY=internal-secret-key
 ```
 
-### 4. Run the Services
+---
 
-#### A. Resume Normalization FastAPI Service
+### 4. Run Services
+
+#### FastAPI Service (Port 8000)
 ```bash
 uvicorn main:app --reload --port 8000
 ```
 
-#### B. LiveKit Voice Agent Worker (VAD + STT)
+#### LiveKit Voice Agent Worker
 ```bash
 python agent.py dev
 ```
 
-## LiveKit Voice Agent Worker & Manual Testing
+---
 
-The `agent.py` script runs a standalone LiveKit Agents worker registered under `agent_name="interview-agent"`.
-It performs:
-- **Voice Activity Detection (VAD)** using local Silero VAD.
-- **Speech-to-Text (STT)** using Groq's hosted Whisper API (`groq.STT`).
+## 🧪 Running Unit Tests
 
-### Manual Testing Steps
+```bash
+pytest
+```
 
-1. **Start LiveKit Dev Server**:
-   ```bash
-   livekit-server --dev
-   ```
+---
 
-2. **Start the Voice Agent Worker**:
-   ```bash
-   python agent.py dev
-   ```
+## 🔗 API Endpoints
 
-3. **Connect a Test Client**:
-   - Open [LiveKit Agents Playground](https://agents-playground.livekit.io/).
-   - Connect to your local LiveKit server instance (`ws://localhost:7880` with dev credentials) or cloud LiveKit project.
-   - Speak into your microphone.
+- **GET `/health`**: Healthcheck (`{"status": "ok"}`)
+- **POST `/resume/normalize`**: Reconstruct raw text into clean markdown `{ "rawText": "..." }`
+- **POST `/resume/check-relevance`**: Assess resume fit against job title `{ "resumeText": "...", "jobTitle": "..." }`
+- **POST `/dispatch-agent`**: Trigger worker dispatch `{ "room": "...", "session_id": 123 }`
+- **Swagger Docs**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-4. **Verify Transcript Output**:
-   - The worker console will output finalized transcripts with timestamps:
-     ```text
-     [2026-08-09 02:45:00] [session=test-session] Candidate said: Hello, I am ready for the interview.
-     ```
-
-## API Endpoints
-
-- **GET `/health`**: Returns `{"status": "ok"}`
-- **POST `/resume/normalize`**: Accepts JSON `{ "rawText": "..." }` and returns `{ "cleanedText": "..." }`
-- **Swagger Documentation**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)

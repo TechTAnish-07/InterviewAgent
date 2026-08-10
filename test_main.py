@@ -62,3 +62,44 @@ def test_strip_code_fences():
     assert resume_service.strip_code_fences("```markdown\n## Skills\nPython\n```") == "## Skills\nPython"
     assert resume_service.strip_code_fences("```\n## Skills\nPython\n```") == "## Skills\nPython"
     assert resume_service.strip_code_fences("## Skills\nPython") == "## Skills\nPython"
+
+
+@patch("app.services.resume_service.acompletion")
+def test_check_relevance_success(mock_acompletion, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="RELEVANT: YES\nREASON: Candidate has strong relevant technical experience."))
+    ]
+
+    async def async_return(*args, **kwargs):
+        return mock_response
+
+    mock_acompletion.side_effect = async_return
+
+    response = client.post(
+        "/resume/check-relevance",
+        json={"resumeText": "Experienced Backend Software Engineer with Java and Python.", "jobTitle": "Backend Engineer"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "relevant": True,
+        "reason": "Candidate has strong relevant technical experience."
+    }
+
+
+@patch("app.services.resume_service.acompletion")
+def test_check_relevance_fail_open_on_error(mock_acompletion, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    mock_acompletion.side_effect = Exception("LLM call timeout")
+
+    response = client.post(
+        "/resume/check-relevance",
+        json={"resumeText": "Experienced Backend Software Engineer.", "jobTitle": "Backend Engineer"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "relevant": True,
+        "reason": "Resume assessment completed."
+    }
+
