@@ -11,3 +11,6 @@ requests>=2.31.0
 livekit-agents>=1.6.9
 livekit-plugins-silero>=1.6.9
 livekit-plugins-groq>=1.6.9
+livekit-plugins-openai>=1.6.9
+livekit-plugins-fishaudio>=1.6.9
+
