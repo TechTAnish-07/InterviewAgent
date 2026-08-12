@@ -1,10 +1,11 @@
+import json
 import os
 from fastapi import HTTPException
 from litellm import acompletion
 from litellm.exceptions import APIError
 from app.config import OPENAI_API_KEY, GEMINI_API_KEY, MODEL_NAME
 from app.prompts.resume_prompt import (
-    RESUME_NORMALIZATION_SYSTEM_PROMPT,
+    RESUME_ANALYSIS_SYSTEM_PROMPT,
     RESUME_RELEVANCE_CHECK_PROMPT,
 )
 
@@ -12,7 +13,9 @@ from app.prompts.resume_prompt import (
 class ResumeService:
     def strip_code_fences(self, text: str) -> str:
         cleaned = text.strip()
-        if cleaned.startswith("```markdown"):
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[len("```json"):].strip()
+        elif cleaned.startswith("```markdown"):
             cleaned = cleaned[len("```markdown"):].strip()
         elif cleaned.startswith("```"):
             cleaned = cleaned[3:].strip()
@@ -20,7 +23,7 @@ class ResumeService:
             cleaned = cleaned[:-3].strip()
         return cleaned.strip()
 
-    async def normalize_resume(self, raw_text: str) -> str:
+    async def normalize_resume(self, raw_text: str) -> dict:
         if not raw_text or len(raw_text) < 50:
             raise HTTPException(
                 status_code=400,
@@ -39,7 +42,7 @@ class ResumeService:
             response = await acompletion(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": RESUME_NORMALIZATION_SYSTEM_PROMPT},
+                    {"role": "system", "content": RESUME_ANALYSIS_SYSTEM_PROMPT},
                     {"role": "user", "content": raw_text},
                 ],
                 temperature=0.0,
@@ -48,7 +51,31 @@ class ResumeService:
             content = response.choices[0].message.content or ""
             cleaned = self.strip_code_fences(content)
             print(f"[ResumeService LLM Response Output]:\n{cleaned}")
-            return cleaned
+
+            try:
+                data = json.loads(cleaned)
+                if isinstance(data, dict):
+                    return {
+                        "cleanedText": data.get("cleanedMarkdown") or data.get("cleanedText") or cleaned,
+                        "candidateName": data.get("candidateName"),
+                        "summary": data.get("summary"),
+                        "skills": data.get("skills") if isinstance(data.get("skills"), list) else [],
+                        "suitableRoles": data.get("suitableRoles") if isinstance(data.get("suitableRoles"), list) else [],
+                        "experienceLevel": data.get("experienceLevel"),
+                    }
+            except Exception as parse_err:
+                print(f"[ResumeService JSON parse fallback]: {parse_err}")
+
+            return {
+                "cleanedText": cleaned,
+                "candidateName": None,
+                "summary": None,
+                "skills": [],
+                "suitableRoles": [],
+                "experienceLevel": None,
+            }
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"[ResumeService LLM Error] {e}")
             raise HTTPException(
@@ -56,12 +83,25 @@ class ResumeService:
                 detail="LLM normalization failed"
             )
 
-    async def check_relevance(self, resume_text: str, job_title: str) -> dict:
+    async def check_relevance(
+        self, resume_text: str, job_title: str, suitable_roles: list[str] | None = None
+    ) -> dict:
         if not resume_text or not job_title:
             return {
                 "relevant": True,
                 "reason": "Resume assessment completed."
             }
+
+        # Fast-path local check if pre-extracted suitable_roles exist
+        if suitable_roles and isinstance(suitable_roles, list) and len(suitable_roles) > 0:
+            title_lower = job_title.lower().strip()
+            for role in suitable_roles:
+                r_lower = role.lower().strip()
+                if r_lower in title_lower or title_lower in r_lower:
+                    return {
+                        "relevant": True,
+                        "reason": f"Your resume aligns well with {job_title} positions based on your verified skills."
+                    }
 
         model_name = os.getenv("MODEL_NAME", MODEL_NAME)
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -90,22 +130,26 @@ class ResumeService:
             content = response.choices[0].message.content or ""
             print(f"[ResumeService LLM Relevance Response]:\n{content}")
 
+            # Strip markdown formatting (*, _, #, `) to ensure robust line parsing
+            cleaned_content = content.replace("*", "").replace("_", "").replace("#", "").replace("`", "").strip()
+
             relevant = True
             reason = "Resume assessment completed."
 
-            lines = content.strip().splitlines()
-            for line in lines:
+            for line in cleaned_content.splitlines():
                 line_str = line.strip()
-                if line_str.upper().startswith("RELEVANT:"):
-                    val = line_str.split(":", 1)[1].strip().upper()
+                upper_line = line_str.upper()
+
+                if "RELEVANT:" in upper_line:
+                    val = upper_line.split("RELEVANT:", 1)[1].strip()
                     if "NO" in val:
                         relevant = False
                     elif "YES" in val:
                         relevant = True
-                elif line_str.upper().startswith("REASON:"):
-                    reason_val = line_str.split(":", 1)[1].strip()
-                    if reason_val:
-                        reason = reason_val
+                elif "REASON:" in upper_line:
+                    parts = line_str.split(":", 1)
+                    if len(parts) > 1 and parts[1].strip():
+                        reason = parts[1].strip()
 
             return {"relevant": relevant, "reason": reason}
 

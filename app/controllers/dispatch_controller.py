@@ -40,13 +40,23 @@ async def dispatch_agent(request: Request):
     # Normalize URL: livekit.api needs http:// not ws://
     http_url = livekit_url.replace("ws://", "http://").replace("wss://", "https://")
 
+    meta_dict = {
+        "sessionId": target_session_id,
+        "candidateName": data.get("candidate_name") or data.get("candidateName") or "Candidate",
+        "jobTitle": data.get("job_title") or data.get("jobTitle") or data.get("jobRole") or "Software Engineer",
+        "summary": data.get("summary") or "",
+        "skills": data.get("skills") or "[]",
+        "resumeText": data.get("resume_text") or data.get("resumeText") or "",
+    }
+    metadata_str = json.dumps(meta_dict)
+
     try:
         lk = api.LiveKitAPI(http_url, api_key, api_secret)
         dispatch = await lk.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
                 agent_name="interview-agent",
                 room=str(target_room),
-                metadata=f'{{"sessionId":{target_session_id}}}',
+                metadata=metadata_str,
             )
         )
         await lk.aclose()

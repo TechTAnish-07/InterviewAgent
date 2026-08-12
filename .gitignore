@@ -20,3 +20,6 @@ env/
 # Testing / Cache
 .pytest_cache/
 .coverage
+
+# Local Conversation Logs
+conversations/

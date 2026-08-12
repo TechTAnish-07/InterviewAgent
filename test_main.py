@@ -40,7 +40,16 @@ def test_normalize_success(mock_acompletion, monkeypatch):
     
     mock_response = MagicMock()
     mock_response.choices = [
-        MagicMock(message=MagicMock(content="```markdown\n## Summary\nCandidate summary\n```"))
+        MagicMock(message=MagicMock(content='''```json
+{
+  "candidateName": "John Doe",
+  "summary": "Software Engineer with 5+ years experience.",
+  "skills": ["Python", "FastAPI"],
+  "suitableRoles": ["Software Engineer", "Backend Developer"],
+  "experienceLevel": "Senior",
+  "cleanedMarkdown": "## Summary\\nCandidate summary"
+}
+```'''))
     ]
     
     async def async_return(*args, **kwargs):
@@ -55,7 +64,14 @@ def test_normalize_success(mock_acompletion, monkeypatch):
     )
     
     assert response.status_code == 200
-    assert response.json() == {"cleanedText": "## Summary\nCandidate summary"}
+    assert response.json() == {
+        "cleanedText": "## Summary\nCandidate summary",
+        "candidateName": "John Doe",
+        "summary": "Software Engineer with 5+ years experience.",
+        "skills": ["Python", "FastAPI"],
+        "suitableRoles": ["Software Engineer", "Backend Developer"],
+        "experienceLevel": "Senior"
+    }
 
 
 def test_strip_code_fences():
@@ -101,5 +117,29 @@ def test_check_relevance_fail_open_on_error(mock_acompletion, monkeypatch):
     assert response.json() == {
         "relevant": True,
         "reason": "Resume assessment completed."
+    }
+
+
+@patch("app.services.resume_service.acompletion")
+def test_check_relevance_markdown_bold_parsing(mock_acompletion, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="**RELEVANT:** NO\n**REASON:** Marketing experience does not match Backend Engineer role."))
+    ]
+
+    async def async_return(*args, **kwargs):
+        return mock_response
+
+    mock_acompletion.side_effect = async_return
+
+    response = client.post(
+        "/resume/check-relevance",
+        json={"resumeText": "Marketing Manager with 5 years experience.", "jobTitle": "Backend Engineer"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "relevant": False,
+        "reason": "Marketing experience does not match Backend Engineer role."
     }
 

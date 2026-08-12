@@ -75,3 +75,25 @@ areas that were weak or under-explored, communication clarity, and 1-2 concrete
 suggestions for improvement. Be honest and specific — reference actual things the
 candidate said, don't give generic praise. Keep it to a few short paragraphs.
 """
+
+# ---------------------------------------------------------------------------
+# Static warning reply templates — used instead of LLM call to save tokens
+# ---------------------------------------------------------------------------
+WARNING_MODERATION_SYSTEM_PROMPT = (
+    "You are an interview moderator. Respond in exactly 1 short sentence."
+)
+
+STATIC_OFF_TOPIC_WARNING = (
+    "Let's keep our discussion focused on the interview — "
+    "could you tell me more about your technical background?"
+)
+
+STATIC_INAPPROPRIATE_WARNING = (
+    "Let's keep this conversation professional — "
+    "please focus on your technical experience and the role."
+)
+
+STATIC_FINAL_WARNING = (
+    "This is a final reminder to keep this interview professional and on-topic — "
+    "continuing this way will end the session."
+)

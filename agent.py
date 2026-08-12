@@ -22,6 +22,9 @@ from prompts import (
     INAPPROPRIATE_WARNING_INSTRUCTION,
     FINAL_WARNING_INSTRUCTION,
     FEEDBACK_GENERATION_PROMPT,
+    STATIC_OFF_TOPIC_WARNING,
+    STATIC_INAPPROPRIATE_WARNING,
+    STATIC_FINAL_WARNING,
 )
 from tools import get_resume_context, end_interview
 
@@ -33,7 +36,43 @@ logger = logging.getLogger("interview-agent")
 
 SPRING_BASE_URL = os.getenv("SPRING_BASE_URL") or os.getenv("BACKEND_URL") or "http://localhost:8080"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY") or "internal-secret-key"
-MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-2.0-flash"
+MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
+
+
+SESSION_CONTEXT_CACHE: dict[str, dict] = {}
+
+
+def log_llm_cost(call_site: str, model: str, response) -> None:
+    """
+    Print token usage and estimated USD cost for every LiteLLM completion call.
+    Uses litellm.completion_cost() for pricing (supports Gemini, OpenAI, etc.).
+    """
+    try:
+        usage = response.usage
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+        try:
+            cost_usd = litellm.completion_cost(completion_response=response)
+        except Exception:
+            cost_usd = 0.0
+        print(
+            f"\n{'\u2500'*65}\n"
+            f"  \U0001f4b0 LLM COST LOG  [{call_site}]\n"
+            f"  Model      : {model}\n"
+            f"  Prompt     : {prompt_tokens:,} tokens\n"
+            f"  Completion : {completion_tokens:,} tokens\n"
+            f"  Total      : {total_tokens:,} tokens\n"
+            f"  Estimated  : ${cost_usd:.6f} USD\n"
+            f"{'\u2500'*65}\n",
+            flush=True,
+        )
+        logger.info(
+            "[COST] %s | model=%s prompt=%d completion=%d total=%d cost=$%.6f",
+            call_site, model, prompt_tokens, completion_tokens, total_tokens, cost_usd,
+        )
+    except Exception as e:
+        logger.warning("Cost logging failed for %s: %s", call_site, e)
 
 
 def extract_session_id(metadata_raw: str | None) -> str | None:
@@ -54,6 +93,31 @@ def extract_session_id(metadata_raw: str | None) -> str | None:
     except Exception as e:
         logger.error("Failed to parse job metadata JSON: %s", e)
         return None
+
+
+def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
+    """
+    Extract pre-packaged candidate context directly from job metadata JSON string without HTTP/DB lookups.
+    """
+    if not metadata_raw or not metadata_raw.strip():
+        return None
+    try:
+        data = json.loads(metadata_raw)
+        if isinstance(data, dict):
+            c_name = data.get("candidateName") or data.get("candidate_name")
+            j_title = data.get("jobTitle") or data.get("job_title") or data.get("jobRole")
+            if c_name and j_title:
+                return {
+                    "candidateName": c_name,
+                    "jobTitle": j_title,
+                    "jobRole": j_title,
+                    "summary": data.get("summary") or "",
+                    "skills": data.get("skills") or "[]",
+                    "resumeText": data.get("resumeText") or data.get("resume_text") or "",
+                }
+    except Exception:
+        pass
+    return None
 
 
 async def fetch_interview_context(session_id: str) -> dict | None:
@@ -191,6 +255,7 @@ async def generate_and_save_feedback(
             temperature=0.5,
             max_tokens=600,
         )
+        log_llm_cost("FEEDBACK_GEN", MODEL_NAME, response)
         feedback_text = response.choices[0].message.content.strip()
         logger.info("Feedback report generated for session %s. Saving to Spring Boot...", session_id)
         await send_feedback_report(session_id, feedback_text)
@@ -220,6 +285,9 @@ class InterviewAgent(Agent):
         self._warning_count = 0
         self.has_candidate_spoken = False
         self._is_ending = False
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
+        self._total_cost_usd: float = 0.0
 
     async def end_interview_flow(self, reason: str) -> None:
         """
@@ -229,6 +297,9 @@ class InterviewAgent(Agent):
             return
         self._is_ending = True
         logger.info("Executing end_interview_flow for session %s (reason: %s)...", self._session_id, reason)
+
+        # Print cumulative cost summary for entire session
+        self.log_session_cost_summary()
 
         # Generate feedback report and save to Spring Boot
         await generate_and_save_feedback(self._session_id, self._context, self._memory, reason)
@@ -307,24 +378,15 @@ class InterviewAgent(Agent):
         ]
 
         try:
-            # LiteLLM call with Gemini model and tools enabled
+            # LiteLLM call with Gemini model. Only end_interview tool is needed;
+            # resume context is already grounded in system_prompt so get_resume_context
+            # tool and its costly retry call are removed.
             response = litellm.completion(
                 model=MODEL_NAME,
                 messages=full_messages,
                 temperature=0.7,
                 max_tokens=200,
                 tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "get_resume_context",
-                            "description": get_resume_context.info.description,
-                            "parameters": {
-                                "type": "object",
-                                "properties": {},
-                            },
-                        },
-                    },
                     {
                         "type": "function",
                         "function": {
@@ -344,6 +406,10 @@ class InterviewAgent(Agent):
                 ],
             )
 
+            # Log token usage and cost for this turn
+            log_llm_cost("MAIN_LLM", MODEL_NAME, response)
+            self._accumulate_cost(response)
+
             msg = response.choices[0].message
             tool_calls = getattr(msg, "tool_calls", None)
 
@@ -361,18 +427,6 @@ class InterviewAgent(Agent):
                         logger.info("[TOOL CALL] Model invoked end_interview with reason: %s", reason)
                         await self.end_interview_flow(reason)
                         return
-                    elif func_name == "get_resume_context":
-                        logger.info("[TOOL CALL] Model invoked get_resume_context")
-                        # Return resume text and retry completion
-                        resume_info = await get_resume_context(self._context)
-                        full_messages.append({"role": "system", "content": f"Resume Context:\n{resume_info}"})
-                        retry_resp = litellm.completion(
-                            model=MODEL_NAME,
-                            messages=full_messages,
-                            temperature=0.7,
-                            max_tokens=200,
-                        )
-                        msg = retry_resp.choices[0].message
 
             reply_text = (msg.content or "").strip()
             reply_text = reply_text.replace("*", "").replace("#", "").replace("`", "")
@@ -404,25 +458,48 @@ class InterviewAgent(Agent):
 
     def _generate_warning_reply(self, candidate_text: str, instruction_prompt: str) -> str:
         """
-        Generate warning response using Gemini via LiteLLM for off-topic/inappropriate inputs.
+        Return static warning redirect — zero LLM API cost.
+        Uses pre-written templates from prompts.py instead of an LLM call.
+        instruction_prompt is kept as a parameter for API compatibility but is no longer used.
         """
-        messages = [
-            {"role": "system", "content": self._system_prompt},
-            {"role": "user", "content": f"Candidate message: \"{candidate_text}\"\nInstruction: {instruction_prompt}"},
-        ]
+        text_lower = candidate_text.lower()
+        from prompts import STATIC_OFF_TOPIC_WARNING, STATIC_INAPPROPRIATE_WARNING, STATIC_FINAL_WARNING
+
+        if self._warning_count >= 2:
+            return STATIC_FINAL_WARNING
+        elif any(w in text_lower for w in ("fuck", "shit", "bitch", "bastard", "idiot", "hate", "shut up")):
+            return STATIC_INAPPROPRIATE_WARNING
+        else:
+            return STATIC_OFF_TOPIC_WARNING
+
+    def _accumulate_cost(self, response) -> None:
+        """Accumulate token usage and cost across all LLM calls for this session."""
         try:
-            response = litellm.completion(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.5,
-                max_tokens=100,
-            )
-            reply = (response.choices[0].message.content or "").strip()
-            reply = reply.replace("*", "").replace("#", "").replace("`", "")
-            return reply or "Let's keep our conversation focused on the technical interview."
-        except Exception as e:
-            logger.error("Error generating warning reply: %s", e)
-            return "Please keep your responses focused on the technical interview."
+            usage = response.usage
+            self._total_prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self._total_completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+            self._total_cost_usd += litellm.completion_cost(completion_response=response)
+        except Exception:
+            pass
+
+    def log_session_cost_summary(self) -> None:
+        """Print cumulative token usage and cost for the entire session."""
+        total_tokens = self._total_prompt_tokens + self._total_completion_tokens
+        print(
+            f"\n{'\u2550'*65}\n"
+            f"  \U0001f4ca SESSION COST SUMMARY (Session: {self._session_id})\n"
+            f"  Total Prompt Tokens     : {self._total_prompt_tokens:,}\n"
+            f"  Total Completion Tokens : {self._total_completion_tokens:,}\n"
+            f"  Total Tokens            : {total_tokens:,}\n"
+            f"  Total Estimated Cost    : ${self._total_cost_usd:.6f} USD\n"
+            f"{'\u2550'*65}\n",
+            flush=True,
+        )
+        logger.info(
+            "[SESSION COST] session=%s prompt=%d completion=%d total=%d cost=$%.6f",
+            self._session_id, self._total_prompt_tokens, self._total_completion_tokens,
+            total_tokens, self._total_cost_usd,
+        )
 
     def _speak_and_log(self, text: str) -> None:
         """
@@ -452,22 +529,43 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Connect to the LiveKit room
     await ctx.connect()
 
-    # Fetch interview context from Spring Boot backend
-    context = await fetch_interview_context(session_id)
+    # 1. Check in-memory SESSION_CONTEXT_CACHE first
+    context = SESSION_CONTEXT_CACHE.get(str(session_id))
+
+    # 2. Check metadata pre-packaged context if not in cache
+    if context is None:
+        context = extract_context_from_metadata(ctx.job.metadata)
+
+    # 3. Fallback to Spring Boot HTTP endpoint if not present in metadata or cache
+    if context is None:
+        logger.info("Fetching interview context via HTTP endpoint for session %s...", session_id)
+        context = await fetch_interview_context(session_id)
+
     if context is None:
         logger.error("Could not obtain interview context for session %s. Disconnecting from room.", session_id)
         await ctx.room.disconnect()
         return
 
+    # Store in SESSION_CONTEXT_CACHE for fast in-memory lookup during call
+    SESSION_CONTEXT_CACHE[str(session_id)] = context
+
     candidate_name = context.get("candidateName") or "Candidate"
     job_role = context.get("jobTitle") or context.get("jobRole") or "Software Engineer"
+    summary = context.get("summary")
+    skills = context.get("skills")
     logger.info("Loaded session %s context: candidate='%s', jobRole='%s'", session_id, candidate_name, job_role)
+
+    extra_context = ""
+    if summary and isinstance(summary, str) and summary.strip():
+        extra_context += f"\n\nCandidate Executive Summary: {summary}"
+    if skills and skills != "[]":
+        extra_context += f"\nVerified Technical Skills: {skills}"
 
     # Format system prompt from SYSTEM_PROMPT_TEMPLATE
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         candidate_name=candidate_name,
         job_role=job_role,
-    )
+    ) + extra_context
 
     # Initialize TTS using LiveKit Cloud Inference (Fish Audio model: fishaudio/s2.1-pro-free)
     if os.getenv("FISH_API_KEY"):
@@ -486,8 +584,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             extra_kwargs={"speed": 1.5, "volume": 1.2},
         )
 
-    # Instantiate bounded working memory
-    memory = ConversationMemory(window_size=5)
+    # Instantiate bounded working memory with local session log support
+    memory = ConversationMemory(window_size=5, session_id=session_id)
 
     session = AgentSession(
         vad=silero.VAD.load(),
