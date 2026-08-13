@@ -35,7 +35,7 @@ flowchart TD
     I -- Count >= 3 --> K[Policy Violation -> End Interview]
     
     H -- Normal --> L[Build Context: Summary + Sliding Window]
-    L --> M[LiteLLM / Gemini 2.0 Flash Call with Tools]
+    L --> M[LiteLLM / Gemini 2.5 Flash Call with Tools]
     
     M -- Tool: end_interview --> N[Execute end_interview_flow]
     M -- Tool: get_resume_context --> O[Fetch & Append Resume Context] --> M
@@ -72,7 +72,7 @@ graph TD
     subgraph External LLM & Voice Services
         AgentWorker --> VAD[Silero VAD]
         AgentWorker --> STT[Groq Whisper STT]
-        AgentWorker --> LLM[LiteLLM / Gemini 2.0 Flash]
+        AgentWorker --> LLM[LiteLLM / Gemini 2.5 Flash]
         AgentWorker --> TTS[Fish Audio TTS]
     end
 ```
@@ -122,7 +122,7 @@ Copy `.env.example` to `.env` and populate your credentials:
 ```env
 GEMINI_API_KEY=your_gemini_api_key
 OPENAI_API_KEY=your_openai_api_key
-MODEL_NAME=gemini/gemini-2.0-flash
+MODEL_NAME=gemini/gemini-2.5-flash
 PORT=8000
 LIVEKIT_URL=ws://127.0.0.1:7880
 LIVEKIT_API_KEY=devkey

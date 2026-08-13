@@ -24,7 +24,7 @@ class ConversationMemory:
         self.rolling_summary: str = ""
         self.window_size: int = window_size
         self.session_id: str | None = session_id
-        self.model_name: str = os.getenv("MODEL_NAME") or "gemini/gemini-2.0-flash"
+        self.model_name: str = os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
 
         # Ensure conversations directory exists
         try:
@@ -116,6 +116,43 @@ class ConversationMemory:
 
         return "\n".join(lines) if lines else "No prior conversation history recorded."
 
+    def get_last_response(self) -> str | None:
+        """
+        Return the most recent non-empty agent (interviewer) reply text.
+        Scans recent_turns in reverse so it correctly skips the current turn
+        (which has an empty agent text when the candidate just asked "please repeat").
+        Priority:
+          1. In-memory recent_turns (fastest, always current for live session)
+          2. Local persisted JSON file (fallback if window was already flushed)
+        Returns None if no prior response is found.
+        """
+        # 1. Scan in-memory sliding window in reverse for last non-empty agent reply
+        for _, agent_text in reversed(self.recent_turns):
+            if agent_text and agent_text.strip():
+                return agent_text.strip()
+
+        # 2. Fallback: read local JSON file for the most recent non-empty interviewer turn
+        if self.session_id:
+            file_path = CONVERSATIONS_DIR / f"{self.session_id}.json"
+            try:
+                if file_path.exists():
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    history = data.get("full_history", [])
+                    for turn in reversed(history):
+                        agent_text = turn.get("interviewer", "").strip()
+                        if agent_text:
+                            logger.info(
+                                "[REPEAT] Loaded last response from local file for session %s (turn %d)",
+                                self.session_id, turn.get("turn", "?"),
+                            )
+                            return agent_text
+            except Exception as e:
+                logger.warning("Error reading local conversation file for repeat: %s", e)
+
+        return None
+
+
     def _save_to_local_file(self) -> None:
         """
         Save conversation log to local JSON file under conversations/{session_id}.json.
@@ -138,3 +175,4 @@ class ConversationMemory:
             logger.info("Saved local conversation log to %s", file_path)
         except Exception as e:
             logger.warning("Error saving local conversation log to %s: %s", file_path, e)
+

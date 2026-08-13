@@ -44,7 +44,7 @@ def check_message_relevance(latest_message: str, recent_turns: list | None = Non
     if not has_off_topic and not has_inappropriate:
         return "NORMAL"
 
-    model_name = os.getenv("MODEL_NAME") or "gemini/gemini-2.0-flash"
+    model_name = os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
 
     context_snippet = ""
     if recent_turns:

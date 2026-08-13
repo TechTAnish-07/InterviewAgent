@@ -2,22 +2,93 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime
+from typing import Any, AsyncGenerator, AsyncIterable
+
+import numpy as np
 
 import aiohttp
 import litellm
 from dotenv import load_dotenv
 
-from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, inference
+from livekit import agents, api, rtc
+from livekit.agents import Agent, AgentSession, InterruptionOptions, ModelSettings, TurnHandlingOptions, inference
+from livekit.agents import tts as agents_tts
 from livekit.agents import llm
+from livekit.agents.voice.speech_handle import SpeechHandle
 from livekit.plugins import fishaudio, groq, openai, silero
+
+
+async def _stream_llm_response(
+    response_stream: Any,
+    full_text_container: list[str],
+    tool_calls_container: list[dict],
+) -> AsyncIterable[str]:
+    """
+    Consumes LiteLLM streaming completion.
+    Yields word-buffered text chunks for sentence-level TTS streaming.
+    Buffering to word (whitespace) boundaries prevents TTS from re-initializing
+    its vocoder mid-phoneme, which was the cause of voice fluctuation/pitch shifts.
+    Accumulates full text into full_text_container[0] and tool calls into tool_calls_container.
+    """
+    accumulated_text: list[str] = []
+    accumulated_tool_calls: dict[int, dict] = {}
+    word_buffer: str = ""
+    try:
+        async for chunk in response_stream:
+            if not chunk or not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None)
+            if content:
+                content_clean = content.replace("*", "").replace("#", "").replace("`", "")
+                if content_clean:
+                    accumulated_text.append(content_clean)
+                    word_buffer += content_clean
+                    # Only yield when we have a complete word boundary (space/newline)
+                    # This avoids mid-phoneme TTS synthesis which causes pitch fluctuation
+                    if " " in word_buffer or "\n" in word_buffer:
+                        parts = word_buffer.rsplit(" ", 1)
+                        to_yield = parts[0] + " "
+                        word_buffer = parts[1] if len(parts) > 1 else ""
+                        yield to_yield
+
+            t_calls = getattr(delta, "tool_calls", None)
+            if t_calls:
+                for tc in t_calls:
+                    idx = getattr(tc, "index", 0) or 0
+                    if idx not in accumulated_tool_calls:
+                        accumulated_tool_calls[idx] = {"name": "", "arguments": ""}
+                    if hasattr(tc, "function") and tc.function:
+                        if getattr(tc.function, "name", None):
+                            accumulated_tool_calls[idx]["name"] += tc.function.name
+                        if getattr(tc.function, "arguments", None):
+                            accumulated_tool_calls[idx]["arguments"] += tc.function.arguments
+    except Exception as e:
+        logger.error("Error consuming LLM response stream: %s", e)
+
+    # Flush remaining buffered text
+    if word_buffer.strip():
+        yield word_buffer
+
+    full_text = "".join(accumulated_text).strip()
+    if not full_text and not accumulated_tool_calls:
+        fallback = "Thank you for sharing that. Could you please tell me more about your technical experience?"
+        accumulated_text.append(fallback)
+        yield fallback
+        full_text = fallback
+
+    full_text_container.append(full_text)
+    if accumulated_tool_calls:
+        tool_calls_container.extend(accumulated_tool_calls.values())
 
 from memory import ConversationMemory
 from moderation import check_message_relevance
 from prompts import (
     SYSTEM_PROMPT_TEMPLATE,
     GREETING_INSTRUCTION,
+    WRAP_UP_INSTRUCTION,
     OFF_TOPIC_WARNING_INSTRUCTION,
     INAPPROPRIATE_WARNING_INSTRUCTION,
     FINAL_WARNING_INSTRUCTION,
@@ -26,7 +97,14 @@ from prompts import (
     STATIC_INAPPROPRIATE_WARNING,
     STATIC_FINAL_WARNING,
 )
-from tools import get_resume_context, end_interview
+from tools import (
+    get_resume_context,
+    end_interview,
+    repeat_last_response,
+    show_coding_question,
+    get_current_code,
+    run_code_check,
+)
 
 load_dotenv()
 
@@ -36,7 +114,108 @@ logger = logging.getLogger("interview-agent")
 
 SPRING_BASE_URL = os.getenv("SPRING_BASE_URL") or os.getenv("BACKEND_URL") or "http://localhost:8080"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY") or "internal-secret-key"
-MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
+MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-3.5-flash"
+
+# Time and turn safety net limits (adjustable product decisions)
+SOFT_TIME_LIMIT_SECONDS: int = int(os.getenv("SOFT_TIME_LIMIT_SECONDS", 1500))  # 25 minutes
+HARD_TIME_LIMIT_SECONDS: int = int(os.getenv("HARD_TIME_LIMIT_SECONDS", 1800))  # 30 minutes
+MAX_TURN_COUNT: int = int(os.getenv("MAX_TURN_COUNT", 40))                      # 40 turns max
+
+# Phrases that signal the candidate wants the agent to repeat its last response.
+# Checked as substrings — add new variants here; order doesn't matter.
+REPEAT_INTENT_TRIGGERS: frozenset[str] = frozenset({
+    "repeat",           # "please repeat", "can you repeat", "repeat that"
+    "say that again",   # "can you say that again"
+    "say it again",     # "say it again please"
+    "didn't catch",     # "I didn't catch that"
+    "didn't hear",      # "I didn't hear you"
+    "can't hear",       # "I can't hear you"
+    "couldn't hear",    # "couldn't hear you"
+    "can you say",      # "can you say that again"
+    "could you say",    # "could you say that one more time"
+    "come again",       # "come again?"
+    "pardon",           # "pardon me?"
+    "what did you say", # "what did you say?"
+    "what was that",    # "what was that?"
+    "one more time",    # "say that one more time"
+    "once more",        # "once more please"
+    "run that by me",   # "run that by me again"
+    "say again",        # radio-style "say again"
+    "didn't understand",# "I didn't understand"
+    "didn't get that",  # "I didn't get that"
+    "not hear",         # "could not hear"
+    "not understand",   # "could not understand"
+})
+
+# Phrases that signal the candidate explicitly wants to end or conclude the interview/session.
+# Fast-path: handled immediately with a warm closing message and room termination.
+END_INTENT_TRIGGERS: frozenset[str] = frozenset({
+    # Interview variants
+    "end interview",
+    "end the interview",
+    "end this interview",
+    "stop interview",
+    "stop the interview",
+    "finish interview",
+    "finish the interview",
+    "finish this interview",
+    "conclude interview",
+    "conclude the interview",
+    "wrap up the interview",
+    "wrap up interview",
+    "terminate interview",
+    "terminate the interview",
+    "leave interview",
+    "leave the interview",
+    "exit interview",
+    "exit the interview",
+    "quit interview",
+    "quit the interview",
+    "done with the interview",
+    "done with interview",
+    # Session variants
+    "end session",
+    "end the session",
+    "end this session",
+    "stop session",
+    "stop the session",
+    "stop this session",
+    "finish session",
+    "finish the session",
+    "finish this session",
+    "conclude session",
+    "conclude the session",
+    "conclude this session",
+    "wrap up session",
+    "wrap up the session",
+    "wrap up this session",
+    "close session",
+    "close the session",
+    "close this session",
+    "done with session",
+    "done with the session",
+    "finalize session",
+    "finalize this session",
+    # Call / conversation variants
+    "end call",
+    "end the call",
+    "end this call",
+    "hang up",
+    "end conversation",
+    "end the conversation",
+    "end this conversation",
+    # Intent phrases
+    "i want to end",
+    "i would like to end",
+    "can we end",
+    "can we wrap up",
+    "can we finish",
+    "let's end here",
+    "let's stop here",
+    "let's finish here",
+    "let's wrap up",
+    "wrap up here",
+})
 
 
 SESSION_CONTEXT_CACHE: dict[str, dict] = {}
@@ -243,7 +422,7 @@ async def generate_and_save_feedback(
     )
 
     messages = [
-        {"role": "system", "content": "You are an expert technical interviewer writing an objective feedback report."},
+        {"role": "system", "content": "You are an expert technical interviewer. Write detailed, structured, honest, and actionable post-interview feedback reports. Always use the exact section headers requested. Be specific — reference what the candidate actually said."},
         {"role": "user", "content": prompt},
     ]
 
@@ -252,8 +431,8 @@ async def generate_and_save_feedback(
         response = litellm.completion(
             model=MODEL_NAME,
             messages=messages,
-            temperature=0.5,
-            max_tokens=600,
+            temperature=0.4,
+            max_tokens=1200,
         )
         log_llm_cost("FEEDBACK_GEN", MODEL_NAME, response)
         feedback_text = response.choices[0].message.content.strip()
@@ -261,6 +440,12 @@ async def generate_and_save_feedback(
         await send_feedback_report(session_id, feedback_text)
     except Exception as e:
         logger.error("Error generating feedback report for session %s: %s", session_id, e)
+
+
+# Software PCM gain applied post-TTS synthesis, before WebRTC dispatch.
+# Fish Audio TTS volume param is clamped server-side, so we amplify here instead.
+# 2.5 ≈ +8 dB, safe for typical speech signals at Fish Audio output levels.
+SOFTWARE_AUDIO_GAIN: float = 2.5
 
 
 class InterviewAgent(Agent):
@@ -288,24 +473,106 @@ class InterviewAgent(Agent):
         self._total_prompt_tokens: int = 0
         self._total_completion_tokens: int = 0
         self._total_cost_usd: float = 0.0
+        self._interview_start_time: float = time.time()
+        self._soft_warning_sent: bool = False
+        self._turn_count: int = 0
+        self._current_speech_handle: SpeechHandle | None = None
+        self._current_turn_task: asyncio.Task | None = None
+        self._greeting_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task] = set()
+
+    def _safe_interrupt(self) -> None:
+        """Safely interrupt the current speech session without throwing if uninitialized."""
+        try:
+            if hasattr(self, "session") and self.session is not None:
+                self.session.interrupt()
+        except Exception as e:
+            logger.debug("Interrupt ignored (session not ready or already completed): %s", e)
+
+    def _record_warning(self, classification: str) -> int:
+        """Atomically increment warning count and log escalation."""
+        self._warning_count += 1
+        logger.warning(
+            "[WARNING] session=%s warning_count=%d class=%s",
+            self._session_id,
+            self._warning_count,
+            classification,
+        )
+        return self._warning_count
+
+    def _get_tool_context(self) -> dict:
+        """Helper to return current session userdata context for tools."""
+        if hasattr(self, "session") and self.session is not None and getattr(self.session, "userdata", None):
+            self.session.userdata["turn_count"] = self._turn_count
+            self.session.userdata["soft_warning_sent"] = self._soft_warning_sent
+            self.session.userdata["interview_start_time"] = self._interview_start_time
+            return self.session.userdata
+        return {
+            "session_id": self._session_id,
+            "interview_context": self._context,
+            "memory": self._memory,
+            "room": self._room,
+            "latest_code": "",
+            "last_run_result": None,
+            "current_question": None,
+            "interview_start_time": self._interview_start_time,
+            "soft_warning_sent": self._soft_warning_sent,
+            "turn_count": self._turn_count,
+        }
 
     async def end_interview_flow(self, reason: str) -> None:
         """
-        Execute session end, generate feedback report, notify Spring Boot, and disconnect room.
+        Execute session end:
+        1. Broadcast INTERVIEW_ENDED data event to room
+        2. Generate feedback report and save to Spring Boot
+        3. Notify Spring Boot of session end
+        4. Delete LiveKit room on server (closes room for all participants including candidate)
+        5. Disconnect agent WebRTC connection
         """
         if self._is_ending:
             return
         self._is_ending = True
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
         logger.info("Executing end_interview_flow for session %s (reason: %s)...", self._session_id, reason)
 
         # Print cumulative cost summary for entire session
         self.log_session_cost_summary()
+
+        # Broadcast interview end data event to frontend so client UI can immediately transition
+        try:
+            if self._room and hasattr(self._room, "local_participant") and self._room.local_participant:
+                end_payload = json.dumps({
+                    "type": "INTERVIEW_ENDED",
+                    "sessionId": self._session_id,
+                    "reason": reason,
+                })
+                await self._room.local_participant.publish_data(end_payload, reliable=True, topic="interview_events")
+                logger.info("Broadcasted INTERVIEW_ENDED data event for session %s", self._session_id)
+        except Exception as e:
+            logger.warning("Error broadcasting INTERVIEW_ENDED event for session %s: %s", self._session_id, e)
 
         # Generate feedback report and save to Spring Boot
         await generate_and_save_feedback(self._session_id, self._context, self._memory, reason)
 
         # Notify Spring Boot of session end
         await notify_session_end(self._session_id, reason)
+
+        # Delete LiveKit room on server to cleanly close room for all participants (candidate + agent)
+        room_name = getattr(self._room, "name", None)
+        if room_name and not isinstance(room_name, type(None)):
+            livekit_url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
+            api_key = os.getenv("LIVEKIT_API_KEY", "devkey")
+            api_secret = os.getenv("LIVEKIT_API_SECRET", "secret")
+            http_url = livekit_url.replace("ws://", "http://").replace("wss://", "https://")
+            try:
+                lk_api = api.LiveKitAPI(http_url, api_key, api_secret)
+                await lk_api.room.delete_room(api.DeleteRoomRequest(room=str(room_name)))
+                await lk_api.aclose()
+                logger.info("Successfully deleted LiveKit room %s on server for session %s", room_name, self._session_id)
+            except Exception as e:
+                logger.warning("Error deleting LiveKit room %s on server: %s", room_name, e)
 
         # Disconnect gracefully from room
         try:
@@ -328,12 +595,15 @@ class InterviewAgent(Agent):
         """
         Called by LiveKit Agents framework when candidate finishes speaking and turn is committed.
         Runs moderation check, warning escalation, memory updates, and LLM reply generation.
+        Cancels any prior in-flight turn task to avoid race conditions.
         """
         if self._is_ending:
             return
 
-        # Candidate spoke; cancel silence greeting
+        # Candidate spoke; cancel silence greeting task if still scheduled
         self.has_candidate_spoken = True
+        if self._greeting_task and not self._greeting_task.done():
+            self._greeting_task.cancel()
 
         transcript = new_message.text_content or ""
         if not transcript.strip():
@@ -341,120 +611,355 @@ class InterviewAgent(Agent):
 
         handle_transcript(self._session_id, transcript)
 
-        # 1. Moderation check on candidate message
+        # Cancel any in-flight turn processing task to prevent overlapping LLM completions / say() calls
+        if self._current_turn_task and not self._current_turn_task.done():
+            logger.info("[TURN CANCEL] Cancelling previous turn processing task for session %s", self._session_id)
+            self._current_turn_task.cancel()
+
+        # Interrupt any speech handle currently playing
+        if self._current_speech_handle and not self._current_speech_handle.done():
+            self._safe_interrupt()
+
+        self._current_turn_task = asyncio.create_task(
+            self._process_user_turn(transcript, turn_ctx)
+        )
+
+    async def _process_user_turn(
+        self, transcript: str, turn_ctx: llm.ChatContext
+    ) -> None:
+        """
+        Processes a committed user turn: early intent checks, moderation, LLM streaming, and tool calls.
+        """
+        # Turn count increment and safety net limits check
+        self._turn_count += 1
+        elapsed = time.time() - self._interview_start_time
+        logger.info("[TURN %d] session=%s elapsed=%.1fs", self._turn_count, self._session_id, elapsed)
+
+        # 0. Hard limits check (Turn count & Time limit) — forced auto-end, bypassing model
+        if self._turn_count >= MAX_TURN_COUNT:
+            logger.warning("[MAX TURNS] Session %s reached max turn count (%d >= %d). Ending interview.", self._session_id, self._turn_count, MAX_TURN_COUNT)
+            closing_msg = (
+                "Thank you for your time today. That concludes our interview session, "
+                "and your feedback report is now being prepared. Best of luck!"
+            )
+            handle = self._speak_and_log(closing_msg, candidate_text=transcript)
+            try:
+                await handle.wait_for_playout()
+            except Exception:
+                pass
+            await self.end_interview_flow("max_turns_reached")
+            return
+
+        if elapsed >= HARD_TIME_LIMIT_SECONDS:
+            logger.warning("[HARD TIME LIMIT] Session %s exceeded hard time limit (%.1fs >= %ds). Ending interview.", self._session_id, elapsed, HARD_TIME_LIMIT_SECONDS)
+            closing_msg = (
+                "Thank you for your time today. That concludes our interview session, "
+                "and your feedback report is now being prepared. Best of luck!"
+            )
+            handle = self._speak_and_log(closing_msg, candidate_text=transcript)
+            try:
+                await handle.wait_for_playout()
+            except Exception:
+                pass
+            await self.end_interview_flow("time_limit_reached")
+            return
+
+        # 1. Early repeat detection — handle BEFORE moderation/LLM to be instant and zero-cost.
+        # REPEAT_INTENT_TRIGGERS is a frozenset of substrings; any match triggers replay.
+        # If the candidate uses a phrase NOT in the list, the LLM still has the
+        # repeat_last_response tool as a fallback to catch intent via semantic understanding.
+        if any(trigger in transcript.lower() for trigger in REPEAT_INTENT_TRIGGERS):
+            last_reply = self._memory.get_last_response()
+            if last_reply:
+                logger.info("[REPEAT] Candidate asked to repeat. Replaying last response (%d chars) for session %s.", len(last_reply), self._session_id)
+                # Pass candidate_text so this turn is properly logged in memory
+                self._speak_and_log(last_reply, candidate_text=transcript)
+                return
+            else:
+                logger.warning("[REPEAT] No prior response in memory for session %s — continuing to LLM.", self._session_id)
+                # Fall through to normal LLM flow if nothing to repeat yet
+
+        # 2. Early end-intent detection — fast-path for candidate asking to conclude/end the interview
+        if any(trigger in transcript.lower() for trigger in END_INTENT_TRIGGERS):
+            logger.info("[END INTENT] Candidate requested to end interview for session %s: %r", self._session_id, transcript)
+            closing_msg = (
+                "Thank you for taking the time to speak with me today. That concludes our interview session, "
+                "and your feedback report is now being prepared. Best of luck!"
+            )
+            handle = self._speak_and_log(closing_msg, candidate_text=transcript)
+            try:
+                await handle.wait_for_playout()
+            except Exception:
+                pass
+            await self.end_interview_flow("candidate_requested_end")
+            return
+
         classification = check_message_relevance(transcript, self._memory.recent_turns)
         logger.info("[MODERATION] session=%s classification=%s text=%r", self._session_id, classification, transcript)
 
-        # 2. Moderation Escalation Handling
-        if classification in ("OFF_TOPIC", "INAPPROPRIATE"):
-            self._warning_count += 1
-            logger.warning("[WARNING] session=%s warning_count=%d class=%s", self._session_id, self._warning_count, classification)
+        # 3. Moderation Escalation Handling
+        if classification in ("OFF_TOPIC", "INAPPROAPPROPRIATE", "INAPPROPRIATE"):
+            warning_count = self._record_warning(classification)
 
-            if self._warning_count == 1:
+            if warning_count == 1:
                 instruction = (
                     OFF_TOPIC_WARNING_INSTRUCTION
                     if classification == "OFF_TOPIC"
                     else INAPPROPRIATE_WARNING_INSTRUCTION
                 )
                 warning_reply = self._generate_warning_reply(transcript, instruction)
-                self._speak_and_log(warning_reply)
+                self._speak_and_log(warning_reply, candidate_text=transcript)
                 return
-            elif self._warning_count == 2:
+            elif warning_count == 2:
                 warning_reply = self._generate_warning_reply(transcript, FINAL_WARNING_INSTRUCTION)
-                self._speak_and_log(warning_reply)
+                self._speak_and_log(warning_reply, candidate_text=transcript)
                 return
             else:
                 # warning_count >= 3: Auto-end for policy violation
-                logger.error("[POLICY VIOLATION] Session %s reached max warnings. Ending interview.", self._session_id)
+                logger.error("[POLICY VIOLATION] Session %s reached max warnings (%d). Ending interview.", self._session_id, warning_count)
                 await self.end_interview_flow("policy_violation")
                 return
 
-        # 3. Normal Reply Flow
+        # 4. Normal Reply Flow
+        system_content = self._system_prompt
+        if elapsed >= SOFT_TIME_LIMIT_SECONDS and not self._soft_warning_sent:
+            self._soft_warning_sent = True
+            system_content += f"\n\n[TIME LIMIT APPROACHING]\n{WRAP_UP_INSTRUCTION}"
+            logger.info("[SOFT TIME LIMIT] Injected WRAP_UP_INSTRUCTION into system prompt for session %s (elapsed=%.1fs >= %ds)", self._session_id, elapsed, SOFT_TIME_LIMIT_SECONDS)
+
         context_messages = self._memory.build_context_messages()
         full_messages = [
-            {"role": "system", "content": self._system_prompt},
+            {"role": "system", "content": system_content},
             *context_messages,
             {"role": "user", "content": transcript},
         ]
 
         try:
-            # LiteLLM call with Gemini model. Only end_interview tool is needed;
-            # resume context is already grounded in system_prompt so get_resume_context
-            # tool and its costly retry call are removed.
-            response = litellm.completion(
-                model=MODEL_NAME,
-                messages=full_messages,
-                temperature=0.7,
-                max_tokens=200,
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "end_interview",
-                            "description": end_interview.info.description,
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "reason": {
-                                        "type": "string",
-                                        "description": "Reason for ending interview (e.g. interview_complete)",
-                                    }
-                                },
+            tools_list = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "end_interview",
+                        "description": end_interview.info.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "reason": {
+                                    "type": "string",
+                                    "description": "Reason for ending interview (e.g. interview_complete)",
+                                }
                             },
                         },
                     },
-                ],
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "repeat_last_response",
+                        "description": repeat_last_response.info.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "reason": {
+                                    "type": "string",
+                                    "description": "Reason for repeating the last response",
+                                }
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "show_coding_question",
+                        "description": show_coding_question.info.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "question_text": {
+                                    "type": "string",
+                                    "description": "The coding question problem statement to display on the candidate's screen.",
+                                }
+                            },
+                            "required": ["question_text"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_code",
+                        "description": get_current_code.info.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "run_code_check",
+                        "description": run_code_check.info.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "language": {
+                                    "type": "string",
+                                    "description": "The programming language of the code (e.g. python, javascript, java, cpp)",
+                                },
+                                "stdin": {
+                                    "type": "string",
+                                    "description": "Optional standard input to feed to the program",
+                                },
+                            },
+                            "required": ["language"],
+                        },
+                    },
+                },
+            ]
+
+            response = await litellm.acompletion(
+                model=MODEL_NAME,
+                messages=full_messages,
+                temperature=0.7,
+                max_tokens=350,
+                stream=True,
+                tools=tools_list,
             )
 
-            # Log token usage and cost for this turn
-            log_llm_cost("MAIN_LLM", MODEL_NAME, response)
-            self._accumulate_cost(response)
+            full_text_container: list[str] = []
+            tool_calls_container: list[dict] = []
+            text_stream = _stream_llm_response(response, full_text_container, tool_calls_container)
 
-            msg = response.choices[0].message
-            tool_calls = getattr(msg, "tool_calls", None)
+            # Stream LLM text chunks sentence-by-sentence to TTS via LiveKit session.say()
+            handle = self._speak_and_log(
+                text_stream,
+                candidate_text=transcript,
+                full_generated_text_container=full_text_container,
+            )
 
-            # Check if model invoked end_interview tool
-            if tool_calls:
-                for tc in tool_calls:
-                    func_name = getattr(tc.function, "name", "")
-                    if func_name == "end_interview":
-                        args_raw = getattr(tc.function, "arguments", "{}")
+            # Await playout of generated response before evaluating tool calls
+            try:
+                await handle.wait_for_playout()
+            except Exception:
+                pass
+
+            for tc in tool_calls_container:
+                func_name = tc.get("name", "")
+
+                if func_name == "end_interview":
+                    args_raw = tc.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except Exception:
+                        args = {}
+                    reason = args.get("reason", "interview_complete")
+                    logger.info("[TOOL CALL] Model invoked end_interview with reason: %s", reason)
+                    # If model didn't speak a closing message (empty text), speak one
+                    if not full_text_container or not full_text_container[0].strip():
+                        closing_msg = (
+                            "Thank you for your time today. That concludes our interview session, "
+                            "and your feedback report is now being prepared. Best of luck!"
+                        )
+                        h = self._speak_and_log(closing_msg)
+                        try:
+                            await h.wait_for_playout()
+                        except Exception:
+                            pass
+                    await self.end_interview_flow(reason)
+                    return
+
+                if func_name == "repeat_last_response":
+                    logger.info("[TOOL CALL] Model invoked repeat_last_response for session %s", self._session_id)
+                    last_reply = self._memory.get_last_response()
+                    if last_reply:
+                        logger.info("[REPEAT] Replaying last agent response (%d chars) for session %s", len(last_reply), self._session_id)
+                        # Speak directly — no new LLM call, zero cost
+                        self._speak_and_log(last_reply)
+                    else:
+                        logger.warning("[REPEAT] No prior response found in memory for session %s", self._session_id)
+                        self._speak_and_log("I'm sorry, I don't have a previous response to repeat. Could you let me know what you'd like me to clarify?")
+                    return
+
+                if func_name == "show_coding_question":
+                    args_raw = tc.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except Exception:
+                        args = {}
+                    question_text = args.get("question_text", "")
+                    logger.info("[TOOL CALL] Model invoked show_coding_question for session %s: %r", self._session_id, question_text[:80])
+                    await show_coding_question(question_text=question_text, context=self._get_tool_context())
+
+                if func_name in ("get_current_code", "run_code_check"):
+                    logger.info("[TOOL CALL] Model invoked %s for session %s", func_name, self._session_id)
+                    tool_result = ""
+                    if func_name == "get_current_code":
+                        tool_result = await get_current_code(context=self._get_tool_context())
+                    elif func_name == "run_code_check":
+                        args_raw = tc.get("arguments", "{}")
                         try:
                             args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                         except Exception:
                             args = {}
-                        reason = args.get("reason", "interview_complete")
-                        logger.info("[TOOL CALL] Model invoked end_interview with reason: %s", reason)
-                        await self.end_interview_flow(reason)
-                        return
+                        lang = args.get("language", "python")
+                        stdin_val = args.get("stdin", "")
+                        tool_result = await run_code_check(language=lang, stdin=stdin_val, context=self._get_tool_context())
 
-            reply_text = (msg.content or "").strip()
-            reply_text = reply_text.replace("*", "").replace("#", "").replace("`", "")
+                    # If model didn't speak a full evaluation (e.g. emitted only tool calls or minimal filler),
+                    # perform follow-up completion with tool output so it speaks its evaluation
+                    if not full_text_container or not full_text_container[0].strip() or len(full_text_container[0].strip()) < 25:
+                        follow_up_messages = [
+                            *full_messages,
+                            {
+                                "role": "assistant",
+                                "content": full_text_container[0] if full_text_container and full_text_container[0].strip() else None,
+                                "tool_calls": [
+                                    {
+                                        "id": tc.get("id") or f"call_{func_name}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": func_name,
+                                            "arguments": tc.get("arguments", "{}") if isinstance(tc.get("arguments"), str) else json.dumps(tc.get("arguments", {})),
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id") or f"call_{func_name}",
+                                "content": tool_result,
+                            },
+                        ]
+                        fu_resp = await litellm.acompletion(
+                            model=MODEL_NAME,
+                            messages=follow_up_messages,
+                            temperature=0.7,
+                            max_tokens=350,
+                            stream=True,
+                            tools=tools_list,
+                        )
+                        fu_full_text: list[str] = []
+                        fu_tool_calls: list[dict] = []
+                        fu_stream = _stream_llm_response(fu_resp, fu_full_text, fu_tool_calls)
+                        fu_handle = self._speak_and_log(
+                            fu_stream,
+                            candidate_text=transcript,
+                            full_generated_text_container=fu_full_text,
+                        )
+                        try:
+                            await fu_handle.wait_for_playout()
+                        except Exception:
+                            pass
 
-            if not reply_text:
-                reply_text = "Thank you for explaining that. Could you tell me more about your technical experience?"
-
-            # Speak reply via TTS
-            self._speak_and_log(reply_text)
-
-            # Update working memory
-            summary_before = self._memory.rolling_summary
-            self._memory.add_turn(transcript, reply_text)
-            summary_updated = self._memory.rolling_summary != summary_before
-
-            logger.info(
-                "[TURN LOG] session=%s classification=%s summary_updated=%s candidate=%r reply=%r",
-                self._session_id,
-                classification,
-                summary_updated,
-                transcript,
-                reply_text,
-            )
-
+        except asyncio.CancelledError:
+            logger.info("[TURN CANCELLED] Turn processing task was cancelled for session %s.", self._session_id)
+            raise
         except Exception as e:
             logger.error("Error in normal reply flow for session %s: %s", self._session_id, e)
             fallback_reply = "Thank you. Could you please elaborate on your technical background?"
-            self._speak_and_log(fallback_reply)
+            self._speak_and_log(fallback_reply, candidate_text=transcript)
 
     def _generate_warning_reply(self, candidate_text: str, instruction_prompt: str) -> str:
         """
@@ -501,19 +1006,105 @@ class InterviewAgent(Agent):
             total_tokens, self._total_cost_usd,
         )
 
-    def _speak_and_log(self, text: str) -> None:
+    def _speak_and_log(
+        self,
+        text: str | AsyncIterable[str],
+        candidate_text: str | None = None,
+        full_generated_text_container: list[str] | None = None,
+    ) -> SpeechHandle:
         """
         Helper to print, log, and speak reply via TTS.
+        Supports both plain string text and streaming AsyncIterable[str] text streams.
+        Attaches a done callback to track speech completion, interruption, and memory updates.
+        Ensures active speech handles are managed safely without race conditions.
         """
-        formatted_response = (
-            f"\n{'*' * 65}\n"
-            f" 🤖 AGENT SPOKEN RESPONSE (Session: {self._session_id})\n"
-            f" 🗣️ Response: \"{text}\"\n"
-            f"{'*' * 65}\n"
-        )
-        print(formatted_response, flush=True)
-        logger.info("[AGENT RESPONSE] session=%s: %s", self._session_id, text)
-        self.session.say(text)
+        # Interrupt any previous speech handle that is still active
+        if self._current_speech_handle is not None and not self._current_speech_handle.done():
+            self._safe_interrupt()
+
+        if isinstance(text, str):
+            formatted_response = (
+                f"\n{'*' * 65}\n"
+                f" 🤖 AGENT SPOKEN RESPONSE (Session: {self._session_id})\n"
+                f" 🗣️ Response: \"{text}\"\n"
+                f"{'*' * 65}\n"
+            )
+            print(formatted_response, flush=True)
+            logger.info("[AGENT RESPONSE] session=%s: %s", self._session_id, text)
+        else:
+            logger.info("[AGENT RESPONSE STREAM] session=%s: Initiated LLM-to-TTS sentence streaming.", self._session_id)
+
+        handle = self.session.say(text)
+        self._current_speech_handle = handle
+
+        committed = False
+
+        def _on_speech_done(h: SpeechHandle) -> None:
+            nonlocal committed
+            if committed:
+                return
+            committed = True
+
+            if self._current_speech_handle is h:
+                self._current_speech_handle = None
+
+            full_gen_text = full_generated_text_container[0] if (full_generated_text_container and full_generated_text_container) else None
+            actually_spoken = full_gen_text or ""
+            if h.chat_items and h.chat_items[0].text_content:
+                actually_spoken = h.chat_items[0].text_content
+            elif isinstance(text, str):
+                actually_spoken = text
+
+            total_text = full_gen_text or (text if isinstance(text, str) else actually_spoken)
+
+            if h.interrupted:
+                logger.warning(
+                    "[INTERRUPTION DETECTED] session=%s: Agent reply interrupted mid-sentence. "
+                    "Delivered %d/%d chars before cutoff: %r",
+                    self._session_id,
+                    len(actually_spoken),
+                    len(total_text),
+                    actually_spoken,
+                )
+            else:
+                logger.info("[SPEECH COMPLETED] session=%s: Full reply delivered (%d chars)", self._session_id, len(actually_spoken))
+
+            if candidate_text is not None:
+                summary_before = self._memory.rolling_summary
+                self._memory.add_turn(candidate_text, actually_spoken)
+                summary_updated = self._memory.rolling_summary != summary_before
+                logger.info(
+                    "[TURN LOG] session=%s summary_updated=%s candidate=%r reply=%r interrupted=%s",
+                    self._session_id,
+                    summary_updated,
+                    candidate_text,
+                    actually_spoken,
+                    h.interrupted,
+                )
+
+        handle.add_done_callback(_on_speech_done)
+        return handle
+
+    async def tts_node(
+        self,
+        text: AsyncIterable[str],
+        model_settings: ModelSettings,
+    ) -> AsyncGenerator[rtc.AudioFrame, None]:
+        """
+        Override Agent.tts_node to apply a software PCM amplitude gain after TTS synthesis.
+        Fish Audio's 'volume' param is clamped server-side; boosting here is independent.
+        """
+        async for frame in Agent.default.tts_node(self, text, model_settings):
+            # frame.data is a memoryview of int16 samples
+            arr = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32)
+            arr = np.clip(arr * SOFTWARE_AUDIO_GAIN, -32768.0, 32767.0)
+            amplified = arr.astype(np.int16).tobytes()
+            yield rtc.AudioFrame(
+                data=amplified,
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+                samples_per_channel=frame.samples_per_channel,
+            )
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
@@ -584,18 +1175,44 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             extra_kwargs={"speed": 1.5, "volume": 1.2},
         )
 
+
     # Instantiate bounded working memory with local session log support
     memory = ConversationMemory(window_size=5, session_id=session_id)
+
+    # Configure interruption behavior with tuned thresholds and options
+    # - allow_interruptions=True: Candidate can interrupt mid-question.
+    # - min_interruption_duration=0.8s: Prevents short pauses/breaths from triggering false interruptions.
+    # - min_interruption_words=2: Guards against single-word filler sounds (e.g., "um", "uh").
+    # Mode selection: We configure adaptive interruption mode in InterruptionOptions.
+    # SDK Note: In livekit-agents v1.6.9, adaptive mode requires STT with streaming aligned transcripts.
+    # Since groq.STT(model="whisper-large-v3") does not provide aligned transcripts, the framework
+    # will automatically fall back to VAD mode using the tuned thresholds above (0.8s min_duration, 2 min_words).
+    turn_handling = TurnHandlingOptions(
+        interruption=InterruptionOptions(
+            enabled=True,
+            mode="adaptive",
+            min_duration=0.8,
+            min_words=2,
+        )
+    )
 
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=groq.STT(model="whisper-large-v3"),
         tts=tts_service,
+        turn_handling=turn_handling,
         userdata={
             "session_id": session_id,
             "interview_context": context,
             "memory": memory,
             "warning_count": 0,
+            "latest_code": "",
+            "last_run_result": None,
+            "current_question": None,
+            "interview_start_time": time.time(),
+            "soft_warning_sent": False,
+            "turn_count": 0,
+            "room": ctx.room,
         },
     )
 
@@ -608,11 +1225,44 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         room=ctx.room,
     )
 
+    # Event handler for data messages (code editor updates & run results from candidate)
+    @ctx.room.on("data_received")
+    def on_data_received(data_packet: rtc.DataPacket) -> None:
+        try:
+            payload_str = data_packet.data.decode("utf-8")
+            payload = json.loads(payload_str)
+            if not isinstance(payload, dict):
+                return
+            msg_type = payload.get("type")
+            if msg_type == "code_update":
+                code = payload.get("code", "")
+                session.userdata["latest_code"] = code
+                logger.info("[DATA CHANNEL] Received code_update (length=%d) for session %s", len(code), session_id)
+            elif msg_type == "code_run_result":
+                code = payload.get("code", "")
+                stdout = payload.get("stdout", "")
+                stderr = payload.get("stderr", "")
+                status = payload.get("status", "")
+                run_result = {
+                    "code": code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "status": status,
+                }
+                session.userdata["last_run_result"] = run_result
+                if code:
+                    session.userdata["latest_code"] = code
+                logger.info("[DATA CHANNEL] Stored last_run_result (status=%s) for session %s", status, session_id)
+        except Exception as e:
+            logger.warning("[DATA CHANNEL] Error processing data packet for session %s: %s", session_id, e)
+
     # Event handler for participant disconnection (end of interview signaling)
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
         logger.info("Participant %s disconnected from room %s.", participant.identity, ctx.room.name)
-        asyncio.create_task(agent.end_interview_flow("candidate_disconnected"))
+        task = asyncio.create_task(agent.end_interview_flow("candidate_disconnected"))
+        agent._background_tasks.add(task)
+        task.add_done_callback(agent._background_tasks.discard)
 
     # Start the agent session
     await session.start(
@@ -623,11 +1273,59 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info("Session %s is live — VAD + STT + TTS pipeline active.", session_id)
 
     # Silence-triggered greeting handling: wait 2.5 seconds; if candidate hasn't spoken, greeting fires
-    await asyncio.sleep(2.5)
-    if not agent.has_candidate_spoken and not agent._is_ending:
-        logger.info("Candidate silent for 2.5s post-start. Generating first greeting...")
-        greeting = await agent.generate_greeting()
-        agent._speak_and_log(greeting)
+    async def _greeting_worker() -> None:
+        try:
+            await asyncio.sleep(2.5)
+            if not agent.has_candidate_spoken and not agent._is_ending:
+                logger.info("Candidate silent for 2.5s post-start. Generating first greeting...")
+                greeting = await agent.generate_greeting()
+                if not agent.has_candidate_spoken and not agent._is_ending:
+                    handle = agent._speak_and_log(greeting)
+
+                    # Store the greeting in memory so repeat-detection can find it if the candidate
+                    # immediately asks "can you repeat that?" before the first real turn.
+                    def _store_greeting(h: SpeechHandle) -> None:
+                        spoken = (h.chat_items[0].text_content if h.chat_items else None) or greeting
+                        # Use empty string for candidate_text so add_turn stores it but won't
+                        # inject it into LLM context as a user message (empty strings are skipped)
+                        memory.recent_turns.append(("", spoken))
+                        logger.info("[GREETING] Stored opening greeting in memory (%d chars) for session %s.", len(spoken), session_id)
+
+                    handle.add_done_callback(_store_greeting)
+        except asyncio.CancelledError:
+            logger.info("Greeting task cancelled for session %s (candidate spoke before silence timeout).", session_id)
+        except Exception as e:
+            logger.warning("Error in greeting task for session %s: %s", session_id, e)
+
+    agent._greeting_task = asyncio.create_task(_greeting_worker())
+
+    # Periodic watchdog task: ensures hard time limit is enforced even if candidate is silent for long stretches
+    async def _time_watchdog() -> None:
+        try:
+            while not agent._is_ending:
+                await asyncio.sleep(5)
+                elapsed = time.time() - agent._interview_start_time
+                if elapsed >= HARD_TIME_LIMIT_SECONDS and not agent._is_ending:
+                    logger.warning("[WATCHDOG] Session %s exceeded hard time limit (%.1fs >= %ds). Forcing interview end.", session_id, elapsed, HARD_TIME_LIMIT_SECONDS)
+                    closing_msg = (
+                        "Thank you for your time today. We have reached the allotted time limit for this interview session, "
+                        "so we will conclude here. Your feedback report is now being prepared. Best of luck!"
+                    )
+                    handle = agent._speak_and_log(closing_msg)
+                    try:
+                        await handle.wait_for_playout()
+                    except Exception:
+                        pass
+                    await agent.end_interview_flow("time_limit_reached")
+                    break
+        except asyncio.CancelledError:
+            logger.debug("[WATCHDOG] Time watchdog cancelled for session %s", session_id)
+        except Exception as e:
+            logger.error("[WATCHDOG] Error in time watchdog for session %s: %s", session_id, e)
+
+    agent._watchdog_task = asyncio.create_task(_time_watchdog())
+    agent._background_tasks.add(agent._watchdog_task)
+    agent._watchdog_task.add_done_callback(agent._background_tasks.discard)
 
 
 if __name__ == "__main__":
