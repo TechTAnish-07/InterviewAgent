@@ -63,7 +63,11 @@ async def repeat_last_response() -> str:
     name="show_coding_question",
     description=(
         "Display a coding question on the candidate's screen in their code editor panel. "
-        "Use this to present ONE technical coding question matched to their experience level."
+        "Use this to present ONE technical coding question matched to their experience level. "
+        "IMPORTANT: The question_text argument MUST contain the COMPLETE problem statement — "
+        "every requirement, example, and constraint the candidate needs to solve the problem. "
+        "Do NOT leave question_text empty and speak the question only verbally; the candidate "
+        "must be able to read the full question on their screen."
     ),
 )
 async def show_coding_question(

@@ -73,11 +73,10 @@ async def _stream_llm_response(
         yield word_buffer
 
     full_text = "".join(accumulated_text).strip()
-    if not full_text and not accumulated_tool_calls:
-        fallback = "Thank you for sharing that. Could you please tell me more about your technical experience?"
-        accumulated_text.append(fallback)
-        yield fallback
-        full_text = fallback
+    # NOTE: If model only emitted tool calls (no text), full_text will be empty — that's fine.
+    # Do NOT inject a fallback phrase here; the tool call handler or caller is responsible for
+    # speaking any required follow-up. Injecting text here causes repetitive questions when
+    # the model legitimately chose to call a tool without speaking.
 
     full_text_container.append(full_text)
     if accumulated_tool_calls:
@@ -85,6 +84,7 @@ async def _stream_llm_response(
 
 from memory import ConversationMemory
 from moderation import check_message_relevance
+from questions import get_question_bank_prompt
 from prompts import (
     SYSTEM_PROMPT_TEMPLATE,
     GREETING_INSTRUCTION,
@@ -116,10 +116,14 @@ SPRING_BASE_URL = os.getenv("SPRING_BASE_URL") or os.getenv("BACKEND_URL") or "h
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY") or "internal-secret-key"
 MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-3.5-flash"
 
-# Time and turn safety net limits (adjustable product decisions)
-SOFT_TIME_LIMIT_SECONDS: int = int(os.getenv("SOFT_TIME_LIMIT_SECONDS", 1500))  # 25 minutes
-HARD_TIME_LIMIT_SECONDS: int = int(os.getenv("HARD_TIME_LIMIT_SECONDS", 1800))  # 30 minutes
+# Time and turn safety net limits (dynamic calculation based on total interview minutes)
+DEFAULT_MAX_INTERVIEW_MINUTES: int = int(os.getenv("MAX_INTERVIEW_MINUTES", os.getenv("HARD_TIME_LIMIT_SECONDS", 1800) // 60))  # Default 30 minutes
+DEFAULT_MAX_TIME_SECONDS: int = DEFAULT_MAX_INTERVIEW_MINUTES * 60
+WARNING_WINDOW_SECONDS: int = int(os.getenv("WARNING_WINDOW_SECONDS", 300))  # 5 minutes before max time
+HARD_TIME_LIMIT_SECONDS: int = DEFAULT_MAX_TIME_SECONDS
+SOFT_TIME_LIMIT_SECONDS: int = max(0, DEFAULT_MAX_TIME_SECONDS - WARNING_WINDOW_SECONDS)
 MAX_TURN_COUNT: int = int(os.getenv("MAX_TURN_COUNT", 40))                      # 40 turns max
+GREETING_SILENCE_DELAY_SECONDS: float = float(os.getenv("GREETING_SILENCE_DELAY_SECONDS", 4.0))  # Seconds of silence before greeting fires
 
 # Phrases that signal the candidate wants the agent to repeat its last response.
 # Checked as substrings — add new variants here; order doesn't matter.
@@ -286,6 +290,7 @@ def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
             c_name = data.get("candidateName") or data.get("candidate_name")
             j_title = data.get("jobTitle") or data.get("job_title") or data.get("jobRole")
             if c_name and j_title:
+                duration_val = data.get("durationMinutes") or data.get("duration_minutes") or data.get("maxInterviewMinutes") or data.get("max_interview_minutes")
                 return {
                     "candidateName": c_name,
                     "jobTitle": j_title,
@@ -293,6 +298,7 @@ def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
                     "summary": data.get("summary") or "",
                     "skills": data.get("skills") or "[]",
                     "resumeText": data.get("resumeText") or data.get("resume_text") or "",
+                    "durationMinutes": duration_val,
                 }
     except Exception:
         pass
@@ -476,6 +482,22 @@ class InterviewAgent(Agent):
         self._interview_start_time: float = time.time()
         self._soft_warning_sent: bool = False
         self._turn_count: int = 0
+        self._is_processing_turn: bool = False
+
+        # Calculate max duration and 5-minute warning threshold
+        duration_min = None
+        if context:
+            duration_min = context.get("durationMinutes") or context.get("duration_minutes") or context.get("maxInterviewMinutes")
+        if duration_min is not None:
+            try:
+                self._max_time_seconds: int = int(duration_min) * 60
+            except (ValueError, TypeError):
+                self._max_time_seconds = DEFAULT_MAX_TIME_SECONDS
+        else:
+            self._max_time_seconds = DEFAULT_MAX_TIME_SECONDS
+
+        self._warning_time_seconds: int = max(0, self._max_time_seconds - WARNING_WINDOW_SECONDS)
+
         self._current_speech_handle: SpeechHandle | None = None
         self._current_turn_task: asyncio.Task | None = None
         self._greeting_task: asyncio.Task | None = None
@@ -507,6 +529,8 @@ class InterviewAgent(Agent):
             self.session.userdata["turn_count"] = self._turn_count
             self.session.userdata["soft_warning_sent"] = self._soft_warning_sent
             self.session.userdata["interview_start_time"] = self._interview_start_time
+            self.session.userdata["max_time_seconds"] = self._max_time_seconds
+            self.session.userdata["warning_time_seconds"] = self._warning_time_seconds
             return self.session.userdata
         return {
             "session_id": self._session_id,
@@ -517,6 +541,8 @@ class InterviewAgent(Agent):
             "last_run_result": None,
             "current_question": None,
             "interview_start_time": self._interview_start_time,
+            "max_time_seconds": self._max_time_seconds,
+            "warning_time_seconds": self._warning_time_seconds,
             "soft_warning_sent": self._soft_warning_sent,
             "turn_count": self._turn_count,
         }
@@ -629,11 +655,13 @@ class InterviewAgent(Agent):
     ) -> None:
         """
         Processes a committed user turn: early intent checks, moderation, LLM streaming, and tool calls.
+        Tracks _is_processing_turn so the time watchdog never interrupts an in-flight conversation turn.
         """
+        self._is_processing_turn = True
         # Turn count increment and safety net limits check
         self._turn_count += 1
         elapsed = time.time() - self._interview_start_time
-        logger.info("[TURN %d] session=%s elapsed=%.1fs", self._turn_count, self._session_id, elapsed)
+        logger.info("[TURN %d] session=%s elapsed=%.1fs (max=%ds, warn_at=%ds)", self._turn_count, self._session_id, elapsed, self._max_time_seconds, self._warning_time_seconds)
 
         # 0. Hard limits check (Turn count & Time limit) — forced auto-end, bypassing model
         if self._turn_count >= MAX_TURN_COUNT:
@@ -650,10 +678,10 @@ class InterviewAgent(Agent):
             await self.end_interview_flow("max_turns_reached")
             return
 
-        if elapsed >= HARD_TIME_LIMIT_SECONDS:
-            logger.warning("[HARD TIME LIMIT] Session %s exceeded hard time limit (%.1fs >= %ds). Ending interview.", self._session_id, elapsed, HARD_TIME_LIMIT_SECONDS)
+        if elapsed >= self._max_time_seconds:
+            logger.warning("[MAX TIME REACHED] Session %s reached max duration (%.1fs >= %ds). Ending interview smoothly.", self._session_id, elapsed, self._max_time_seconds)
             closing_msg = (
-                "Thank you for your time today. That concludes our interview session, "
+                "Thank you for your time today. We have reached the allotted time for this interview session, "
                 "and your feedback report is now being prepared. Best of luck!"
             )
             handle = self._speak_and_log(closing_msg, candidate_text=transcript)
@@ -694,6 +722,30 @@ class InterviewAgent(Agent):
             await self.end_interview_flow("candidate_requested_end")
             return
 
+        # 2.5 Early question re-display detection — fast-path for candidate asking where the question is
+        QUESTION_QUERY_TRIGGERS = (
+            "where is the question", "where is the problem", "can't find the question",
+            "cannot find the question", "can't see the question", "cannot see the question",
+            "share the question", "show the question", "show me the question",
+            "send the question", "what is the question", "what's the question",
+            "not able to see", "unable to see", "where question"
+        )
+        if any(trig in transcript.lower() for trig in QUESTION_QUERY_TRIGGERS):
+            from questions import ALL_QUESTIONS
+            ctx_dict = self._get_tool_context()
+            current_q = ctx_dict.get("current_question") if ctx_dict else None
+            if not current_q:
+                current_q = ALL_QUESTIONS["E1"]["body"]
+
+            logger.info("[QUESTION RESEND] Candidate asked for question. Re-publishing for session %s.", self._session_id)
+            await show_coding_question(question_text=current_q, context=ctx_dict)
+            reassurance_msg = (
+                "I've displayed the coding problem on your screen in the code editor panel. "
+                "Please take a look and let me know when you are ready to begin."
+            )
+            self._speak_and_log(reassurance_msg, candidate_text=transcript)
+            return
+
         classification = check_message_relevance(transcript, self._memory.recent_turns)
         logger.info("[MODERATION] session=%s classification=%s text=%r", self._session_id, classification, transcript)
 
@@ -722,10 +774,18 @@ class InterviewAgent(Agent):
 
         # 4. Normal Reply Flow
         system_content = self._system_prompt
-        if elapsed >= SOFT_TIME_LIMIT_SECONDS and not self._soft_warning_sent:
+        time_remaining = self._max_time_seconds - elapsed
+        if elapsed >= self._warning_time_seconds and not self._soft_warning_sent:
             self._soft_warning_sent = True
-            system_content += f"\n\n[TIME LIMIT APPROACHING]\n{WRAP_UP_INSTRUCTION}"
-            logger.info("[SOFT TIME LIMIT] Injected WRAP_UP_INSTRUCTION into system prompt for session %s (elapsed=%.1fs >= %ds)", self._session_id, elapsed, SOFT_TIME_LIMIT_SECONDS)
+            remaining_mins = max(1, int(round(time_remaining / 60)))
+            system_content += f"\n\n[TIME LIMIT APPROACHING: ~{remaining_mins} MINUTES REMAINING]\n{WRAP_UP_INSTRUCTION}"
+            logger.info(
+                "[TIME WARNING] Injected WRAP_UP_INSTRUCTION into system prompt for session %s (elapsed=%.1fs, remaining=%.1fs <= %ds)",
+                self._session_id,
+                elapsed,
+                time_remaining,
+                WARNING_WINDOW_SECONDS,
+            )
 
         context_messages = self._memory.build_context_messages()
         full_messages = [
@@ -888,9 +948,42 @@ class InterviewAgent(Agent):
                         args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                     except Exception:
                         args = {}
-                    question_text = args.get("question_text", "")
+                    question_text = args.get("question_text", "").strip()
+
+                    from questions import ALL_QUESTIONS
+                    # If question_text is an ID like "E1", "M1", "H2", or title, resolve from ALL_QUESTIONS
+                    if question_text in ALL_QUESTIONS:
+                        question_text = ALL_QUESTIONS[question_text]["body"]
+                    else:
+                        for q_info in ALL_QUESTIONS.values():
+                            if q_info["title"].lower() in question_text.lower():
+                                question_text = q_info["body"]
+                                break
+
+                    # Fallback to spoken text if available
+                    if not question_text and full_text_container and full_text_container[0].strip():
+                        spoken = full_text_container[0].strip()
+                        if len(spoken) > 80 or "\n" in spoken:
+                            question_text = spoken
+
+                    # Final fallback: Two Sum (E1)
+                    if not question_text:
+                        question_text = ALL_QUESTIONS["E1"]["body"]
+
                     logger.info("[TOOL CALL] Model invoked show_coding_question for session %s: %r", self._session_id, question_text[:80])
                     await show_coding_question(question_text=question_text, context=self._get_tool_context())
+
+                    # If model didn't speak a transition message, announce the question aloud
+                    if not full_text_container or not full_text_container[0].strip():
+                        transition_msg = (
+                            "I have displayed the coding question on your screen. "
+                            "Take your time to read through it, and write out your solution in the code editor."
+                        )
+                        h = self._speak_and_log(transition_msg)
+                        try:
+                            await h.wait_for_playout()
+                        except Exception:
+                            pass
 
                 if func_name in ("get_current_code", "run_code_check"):
                     logger.info("[TOOL CALL] Model invoked %s for session %s", func_name, self._session_id)
@@ -958,8 +1051,11 @@ class InterviewAgent(Agent):
             raise
         except Exception as e:
             logger.error("Error in normal reply flow for session %s: %s", self._session_id, e)
-            fallback_reply = "Thank you. Could you please elaborate on your technical background?"
-            self._speak_and_log(fallback_reply, candidate_text=transcript)
+            # Do NOT speak a canned background question as fallback — it causes the agent to
+            # keep asking the same question repeatedly when errors occur. Silently fail instead
+            # so the candidate can just speak again and trigger a fresh turn naturally.
+        finally:
+            self._is_processing_turn = False
 
     def _generate_warning_reply(self, candidate_text: str, instruction_prompt: str) -> str:
         """
@@ -1152,27 +1248,35 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     if skills and skills != "[]":
         extra_context += f"\nVerified Technical Skills: {skills}"
 
-    # Format system prompt from SYSTEM_PROMPT_TEMPLATE
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        candidate_name=candidate_name,
-        job_role=job_role,
-    ) + extra_context
+    # Format system prompt from SYSTEM_PROMPT_TEMPLATE + question bank
+    # Appending the hardcoded question bank means the LLM always picks from a
+    # pre-written, complete question body instead of generating one on the fly.
+    # This eliminates the "empty question_text" bug and guarantees well-formed questions.
+    system_prompt = (
+        SYSTEM_PROMPT_TEMPLATE.format(
+            candidate_name=candidate_name,
+            job_role=job_role,
+        )
+        + extra_context
+        + get_question_bank_prompt()
+    )
 
-    # Initialize TTS using LiveKit Cloud Inference (Fish Audio model: fishaudio/s2.1-pro-free)
+    # Initialize TTS using LiveKit Cloud Inference / Fish Audio TTS
+    tts_speed: float = float(os.getenv("TTS_SPEED", "1.1"))
     if os.getenv("FISH_API_KEY"):
-        logger.info("Using direct Fish Audio TTS plugin (voice: b347db033a6549378b48d00acb0d06cd)")
+        logger.info("Using direct Fish Audio TTS plugin (voice: b347db033a6549378b48d00acb0d06cd, speed=%.2f)", tts_speed)
         tts_service = fishaudio.TTS(
             voice_id="b347db033a6549378b48d00acb0d06cd",
-            speed=1.5,
+            speed=tts_speed,
             volume=1.2,
         )
     else:
-        logger.info("Using LiveKit Cloud Inference Fish Audio TTS (model: fishaudio/s2.1-pro-free)")
+        logger.info("Using LiveKit Cloud Inference Fish Audio TTS (model: fishaudio/s2.1-pro-free, speed=%.2f)", tts_speed)
         tts_service = inference.TTS(
             model="fishaudio/s2.1-pro-free",
             voice="b347db033a6549378b48d00acb0d06cd",
             language="en",
-            extra_kwargs={"speed": 1.5, "volume": 1.2},
+            extra_kwargs={"speed": tts_speed, "volume": 1.2},
         )
 
 
@@ -1196,9 +1300,43 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         )
     )
 
+    # Build a Whisper prompt from candidate tech vocabulary to reduce hallucinations.
+    # Whisper uses this (up to 224 tokens) to bias recognition toward known terms —
+    # e.g. "Next.js" won't be heard as "Next JS" or "3xjs", "LiteLLM" won't be garbled, etc.
+    stt_vocab_terms: list[str] = [candidate_name, job_role]
+    if skills and isinstance(skills, str) and skills.strip() not in ("", "[]"):
+        # skills may be a JSON array string like '["Spring Boot", "React"]' or plain comma-sep
+        try:
+            import json as _json
+            parsed_skills = _json.loads(skills)
+            if isinstance(parsed_skills, list):
+                stt_vocab_terms.extend([s for s in parsed_skills if isinstance(s, str)])
+        except Exception:
+            # Fallback: treat as comma-separated string
+            stt_vocab_terms.extend([s.strip() for s in skills.split(",") if s.strip()])
+    # Add a broad base of common technical terms to cover any gaps
+    stt_vocab_terms += [
+        "Python", "Java", "Spring Boot", "React", "Next.js", "TypeScript", "JavaScript",
+        "Node.js", "Flask", "FastAPI", "LangChain", "LiteLLM", "MCP", "Playwright",
+        "LLM", "RAG", "Docker", "Kubernetes", "PostgreSQL", "MongoDB", "REST API",
+        "GraphQL", "AWS", "GCP", "Azure", "Git", "GitHub", "CI/CD", "Groq", "Whisper",
+    ]
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_terms: list[str] = []
+    for t in stt_vocab_terms:
+        if t and t not in seen:
+            seen.add(t)
+            unique_terms.append(t)
+    stt_prompt = (
+        f"This is a technical software engineering interview with {candidate_name} for a {job_role} role. "
+        f"Technical terms that may appear: {', '.join(unique_terms[:40])}."
+    )
+    logger.info("[STT] Whisper prompt built (%d chars): %r", len(stt_prompt), stt_prompt[:120])
+
     session = AgentSession(
         vad=silero.VAD.load(),
-        stt=groq.STT(model="whisper-large-v3"),
+        stt=groq.STT(model="whisper-large-v3", language="en", prompt=stt_prompt),
         tts=tts_service,
         turn_handling=turn_handling,
         userdata={
@@ -1264,6 +1402,28 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         agent._background_tasks.add(task)
         task.add_done_callback(agent._background_tasks.discard)
 
+    # Event listeners on AgentSession for real-time VAD & transcript events:
+    # Immediately cancel the opening greeting if the candidate starts speaking before the silence timeout.
+    # This prevents the glitch where the agent starts speaking greeting right as user finishes speaking,
+    # then abruptly interrupts itself.
+    @session.on("user_state_changed")
+    def _on_user_state_changed(ev: Any) -> None:
+        new_state = getattr(ev, "new_state", None)
+        if new_state == "speaking":
+            agent.has_candidate_spoken = True
+            if agent._greeting_task and not agent._greeting_task.done():
+                logger.info("[GREETING CANCEL] Candidate started speaking (user_state=speaking). Cancelling opening greeting.")
+                agent._greeting_task.cancel()
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev: Any) -> None:
+        transcript = getattr(ev, "transcript", "")
+        if transcript and transcript.strip():
+            agent.has_candidate_spoken = True
+            if agent._greeting_task and not agent._greeting_task.done():
+                logger.info("[GREETING CANCEL] Candidate speech transcribed (%r). Cancelling opening greeting.", transcript[:40])
+                agent._greeting_task.cancel()
+
     # Start the agent session
     await session.start(
         room=ctx.room,
@@ -1272,14 +1432,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     logger.info("Session %s is live — VAD + STT + TTS pipeline active.", session_id)
 
-    # Silence-triggered greeting handling: wait 2.5 seconds; if candidate hasn't spoken, greeting fires
+    # Silence-triggered greeting handling: wait GREETING_SILENCE_DELAY_SECONDS; if candidate hasn't spoken, greeting fires
     async def _greeting_worker() -> None:
         try:
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(GREETING_SILENCE_DELAY_SECONDS)
             if not agent.has_candidate_spoken and not agent._is_ending:
-                logger.info("Candidate silent for 2.5s post-start. Generating first greeting...")
+                # Double-check real-time user state right before speaking to prevent race condition
+                if getattr(session, "user_state", None) == "speaking":
+                    logger.info("[GREETING CANCEL] Candidate is speaking at silence timeout. Aborting auto-greeting.")
+                    agent.has_candidate_spoken = True
+                    return
+
+                logger.info("Candidate silent for %.1fs post-start. Generating first greeting...", GREETING_SILENCE_DELAY_SECONDS)
                 greeting = await agent.generate_greeting()
-                if not agent.has_candidate_spoken and not agent._is_ending:
+                if not agent.has_candidate_spoken and not agent._is_ending and getattr(session, "user_state", None) != "speaking":
                     handle = agent._speak_and_log(greeting)
 
                     # Store the greeting in memory so repeat-detection can find it if the candidate
@@ -1299,14 +1465,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     agent._greeting_task = asyncio.create_task(_greeting_worker())
 
-    # Periodic watchdog task: ensures hard time limit is enforced even if candidate is silent for long stretches
+    # Periodic watchdog task: ensures time limit is enforced even if candidate is silent for long stretches
     async def _time_watchdog() -> None:
         try:
             while not agent._is_ending:
                 await asyncio.sleep(5)
                 elapsed = time.time() - agent._interview_start_time
-                if elapsed >= HARD_TIME_LIMIT_SECONDS and not agent._is_ending:
-                    logger.warning("[WATCHDOG] Session %s exceeded hard time limit (%.1fs >= %ds). Forcing interview end.", session_id, elapsed, HARD_TIME_LIMIT_SECONDS)
+                if elapsed >= agent._max_time_seconds and not agent._is_ending:
+                    # Avoid race conditions: if candidate turn is actively being processed or agent is actively speaking, wait for that turn to complete cleanly
+                    if agent._is_processing_turn or (agent._current_speech_handle and not agent._current_speech_handle.done()):
+                        logger.debug("[WATCHDOG] Session %s reached max time (%.1fs >= %ds), waiting for active turn/speech to complete.", session_id, elapsed, agent._max_time_seconds)
+                        continue
+
+                    logger.warning("[WATCHDOG] Session %s exceeded max duration during silence/inactivity (%.1fs >= %ds). Concluding interview.", session_id, elapsed, agent._max_time_seconds)
                     closing_msg = (
                         "Thank you for your time today. We have reached the allotted time limit for this interview session, "
                         "so we will conclude here. Your feedback report is now being prepared. Best of luck!"

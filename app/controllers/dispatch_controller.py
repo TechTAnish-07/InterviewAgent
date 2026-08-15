@@ -47,6 +47,7 @@ async def dispatch_agent(request: Request):
         "summary": data.get("summary") or "",
         "skills": data.get("skills") or "[]",
         "resumeText": data.get("resume_text") or data.get("resumeText") or "",
+        "durationMinutes": data.get("duration_minutes") or data.get("durationMinutes") or data.get("max_interview_minutes") or data.get("maxInterviewMinutes"),
     }
     metadata_str = json.dumps(meta_dict)
 
