@@ -415,6 +415,9 @@ async def generate_and_save_feedback(
         logger.info("Skipping feedback generation for session %s due to policy_violation with minimal turns.", session_id)
         return
 
+    if memory:
+        await memory.flush_pending_folds()
+
     candidate_name = (context.get("candidateName") if context else None) or "Candidate"
     job_role = (context.get("jobTitle") or context.get("jobRole") if context else None) or "Software Engineer"
     resume_text = (context.get("resumeText") if context else None) or "Not provided"
@@ -631,7 +634,7 @@ class InterviewAgent(Agent):
         if self._greeting_task and not self._greeting_task.done():
             self._greeting_task.cancel()
 
-        transcript = new_message.text_content or ""
+        transcript = getattr(new_message, "text_content", "") or ""
         if not transcript.strip():
             return
 
@@ -1146,8 +1149,9 @@ class InterviewAgent(Agent):
 
             full_gen_text = full_generated_text_container[0] if (full_generated_text_container and full_generated_text_container) else None
             actually_spoken = full_gen_text or ""
-            if h.chat_items and h.chat_items[0].text_content:
-                actually_spoken = h.chat_items[0].text_content
+            first_item_text = getattr(h.chat_items[0], "text_content", None) if h.chat_items else None
+            if first_item_text:
+                actually_spoken = first_item_text
             elif isinstance(text, str):
                 actually_spoken = text
 
@@ -1280,8 +1284,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         )
 
 
-    # Instantiate bounded working memory with local session log support
-    memory = ConversationMemory(window_size=5, session_id=session_id)
+    # Instantiate bounded working memory with local session log support (10 turn pairs window)
+    memory = ConversationMemory(window_size=10, session_id=session_id)
 
     # Configure interruption behavior with tuned thresholds and options
     # - allow_interruptions=True: Candidate can interrupt mid-question.
@@ -1451,7 +1455,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     # Store the greeting in memory so repeat-detection can find it if the candidate
                     # immediately asks "can you repeat that?" before the first real turn.
                     def _store_greeting(h: SpeechHandle) -> None:
-                        spoken = (h.chat_items[0].text_content if h.chat_items else None) or greeting
+                        first_item_text = getattr(h.chat_items[0], "text_content", None) if h.chat_items else None
+                        spoken = first_item_text or greeting
                         # Use empty string for candidate_text so add_turn stores it but won't
                         # inject it into LLM context as a user message (empty strings are skipped)
                         memory.recent_turns.append(("", spoken))
