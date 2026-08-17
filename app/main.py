@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
             agent_process.kill()
 
 
+
 app = FastAPI(
     title="Resume Normalization Agent API",
     docs_url="/docs",
