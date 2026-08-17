@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import sys
 from contextlib import asynccontextmanager
@@ -10,11 +11,15 @@ logger = logging.getLogger("uvicorn")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: spawn LiveKit Agent worker process (agent.py dev)
+    # Startup: spawn LiveKit Agent worker process in 'start' mode (connects to LiveKit Cloud)
     agent_process = None
+    livekit_url = os.getenv("LIVEKIT_URL", "NOT SET")
     try:
-        logger.info("Starting LiveKit Voice Agent worker process (agent.py dev)...")
-        agent_process = subprocess.Popen([sys.executable, "agent.py", "dev"])
+        logger.info("Starting LiveKit Voice Agent worker (start mode) connecting to: %s", livekit_url)
+        agent_process = subprocess.Popen(
+            [sys.executable, "agent.py", "start"],
+            env={**os.environ},  # Pass all env vars including LIVEKIT_URL, API keys, etc.
+        )
     except Exception as e:
         logger.error("Failed to start LiveKit Agent worker process: %s", e)
 
