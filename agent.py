@@ -247,7 +247,7 @@ def log_llm_cost(call_site: str, model: str, response) -> None:
             f"  Completion : {completion_tokens:,} tokens\n"
             f"  Total      : {total_tokens:,} tokens\n"
             f"  Estimated  : ${cost_usd:.6f} USD\n"
-            f"{'\u2500'*65}\n",
+            f"{'\u2500'*65}",
             flush=True,
         )
         logger.info(
