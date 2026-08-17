@@ -239,15 +239,16 @@ def log_llm_cost(call_site: str, model: str, response) -> None:
             cost_usd = litellm.completion_cost(completion_response=response)
         except Exception:
             cost_usd = 0.0
+        sep = "\u2500" * 65
         print(
-            f"\n{'\u2500'*65}\n"
+            f"\n{sep}\n"
             f"  \U0001f4b0 LLM COST LOG  [{call_site}]\n"
             f"  Model      : {model}\n"
             f"  Prompt     : {prompt_tokens:,} tokens\n"
             f"  Completion : {completion_tokens:,} tokens\n"
             f"  Total      : {total_tokens:,} tokens\n"
             f"  Estimated  : ${cost_usd:.6f} USD\n"
-            f"{'\u2500'*65}",
+            f"{sep}",
             flush=True,
         )
         logger.info(
@@ -1121,12 +1122,13 @@ class InterviewAgent(Agent):
         if self._current_speech_handle is not None and not self._current_speech_handle.done():
             self._safe_interrupt()
 
+        sep = "*" * 65
         if isinstance(text, str):
             formatted_response = (
-                f"\n{'*' * 65}\n"
+                f"\n{sep}\n"
                 f" 🤖 AGENT SPOKEN RESPONSE (Session: {self._session_id})\n"
                 f" 🗣️ Response: \"{text}\"\n"
-                f"{'*' * 65}\n"
+                f"{sep}\n"
             )
             print(formatted_response, flush=True)
             logger.info("[AGENT RESPONSE] session=%s: %s", self._session_id, text)
