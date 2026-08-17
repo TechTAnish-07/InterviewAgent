@@ -1090,14 +1090,15 @@ class InterviewAgent(Agent):
     def log_session_cost_summary(self) -> None:
         """Print cumulative token usage and cost for the entire session."""
         total_tokens = self._total_prompt_tokens + self._total_completion_tokens
+        sep = "\u2550" * 65
         print(
-            f"\n{'\u2550'*65}\n"
+            f"\n{sep}\n"
             f"  \U0001f4ca SESSION COST SUMMARY (Session: {self._session_id})\n"
             f"  Total Prompt Tokens     : {self._total_prompt_tokens:,}\n"
             f"  Total Completion Tokens : {self._total_completion_tokens:,}\n"
             f"  Total Tokens            : {total_tokens:,}\n"
             f"  Total Estimated Cost    : ${self._total_cost_usd:.6f} USD\n"
-            f"{'\u2550'*65}\n",
+            f"{sep}\n",
             flush=True,
         )
         logger.info(
