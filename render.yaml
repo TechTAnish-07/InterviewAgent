@@ -1,0 +1,56 @@
+services:
+  # 1. FastAPI Web Microservice
+  - type: web
+    name: interview-agent-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: SPRING_BASE_URL
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: MODEL_NAME
+        value: gemini/gemini-2.5-flash
+
+  # 2. LiveKit Voice Agent Worker
+  - type: worker
+    name: interview-agent-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent.py start
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: SPRING_BASE_URL
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: MODEL_NAME
+        value: gemini/gemini-2.5-flash
