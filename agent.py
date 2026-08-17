@@ -1514,5 +1514,6 @@ if __name__ == "__main__":
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
             agent_name=agent_name,
+            host="127.0.0.1",
         )
     )
