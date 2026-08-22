@@ -18,6 +18,6 @@ COPY . .
 
 RUN chmod +x start.sh
 
-EXPOSE 8000
+EXPOSE 8000 10000
 
-CMD ["python", "agent.py", "start"]
+CMD ["./start.sh"]

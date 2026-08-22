@@ -4,10 +4,12 @@ services:
     name: interview-agent-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: sh -c "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PORT
+        value: 10000
       - key: GEMINI_API_KEY
         sync: false
       - key: OPENAI_API_KEY
