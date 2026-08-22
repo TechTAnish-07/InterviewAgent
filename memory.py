@@ -38,6 +38,7 @@ class ConversationMemory:
         batch_fold_size: int = DEFAULT_BATCH_FOLD_SIZE,
         max_recent_tokens: int = DEFAULT_MAX_RECENT_TOKENS,
         summarization_model: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.recent_turns: list[tuple[str, str]] = []  # [(user_text, agent_text), ...]
         self.full_history: list[dict] = []  # [{turn: 1, timestamp: "...", candidate: "...", interviewer: "..."}, ...]
@@ -50,6 +51,7 @@ class ConversationMemory:
         self.max_recent_tokens: int = max_recent_tokens
         self.session_id: str | None = session_id
         self.summarization_model: str = summarization_model or SUMMARIZATION_MODEL
+        self.api_key: str | None = api_key
 
         self._fold_lock: asyncio.Lock | None = None
         self._is_folding: bool = False
@@ -194,12 +196,16 @@ class ConversationMemory:
         )
 
         try:
-            response = await litellm.acompletion(
-                model=self.summarization_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=200,
-            )
+            acompletion_kwargs = {
+                "model": self.summarization_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 200,
+            }
+            if self.api_key:
+                acompletion_kwargs["api_key"] = self.api_key
+
+            response = await litellm.acompletion(**acompletion_kwargs)
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             summary = response.choices[0].message.content.strip()
 

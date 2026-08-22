@@ -292,6 +292,17 @@ def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
             j_title = data.get("jobTitle") or data.get("job_title") or data.get("jobRole")
             if c_name and j_title:
                 duration_val = data.get("durationMinutes") or data.get("duration_minutes") or data.get("maxInterviewMinutes") or data.get("max_interview_minutes")
+                custom_api_key = data.get("apiKey") or data.get("api_key")
+                provider = data.get("provider") or data.get("llm_provider") or data.get("llmProvider")
+                model_name = data.get("modelName") or data.get("model_name") or data.get("model")
+
+                if provider and model_name and "/" not in model_name:
+                    resolved_model = f"{str(provider).lower().strip()}/{str(model_name).strip()}"
+                elif model_name:
+                    resolved_model = str(model_name).strip()
+                else:
+                    resolved_model = None
+
                 return {
                     "candidateName": c_name,
                     "jobTitle": j_title,
@@ -300,6 +311,9 @@ def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
                     "skills": data.get("skills") or "[]",
                     "resumeText": data.get("resumeText") or data.get("resume_text") or "",
                     "durationMinutes": duration_val,
+                    "apiKey": str(custom_api_key).strip() if custom_api_key else None,
+                    "provider": str(provider).strip() if provider else None,
+                    "modelName": resolved_model,
                 }
     except Exception:
         pass
@@ -436,15 +450,22 @@ async def generate_and_save_feedback(
         {"role": "user", "content": prompt},
     ]
 
+    model_to_use = (context.get("modelName") if context else None) or os.getenv("MODEL_NAME", MODEL_NAME)
+    custom_api_key = (context.get("apiKey") if context else None)
+
     try:
-        logger.info("Generating feedback report for session %s...", session_id)
-        response = litellm.completion(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.4,
-            max_tokens=1200,
-        )
-        log_llm_cost("FEEDBACK_GEN", MODEL_NAME, response)
+        logger.info("Generating feedback report for session %s (model: %s)...", session_id, model_to_use)
+        comp_kwargs = {
+            "model": model_to_use,
+            "messages": messages,
+            "temperature": 0.4,
+            "max_tokens": 1200,
+        }
+        if custom_api_key:
+            comp_kwargs["api_key"] = custom_api_key
+
+        response = litellm.completion(**comp_kwargs)
+        log_llm_cost("FEEDBACK_GEN", model_to_use, response)
         feedback_text = response.choices[0].message.content.strip()
         logger.info("Feedback report generated for session %s. Saving to Spring Boot...", session_id)
         await send_feedback_report(session_id, feedback_text)
@@ -487,6 +508,16 @@ class InterviewAgent(Agent):
         self._soft_warning_sent: bool = False
         self._turn_count: int = 0
         self._is_processing_turn: bool = False
+
+        # Model and API key configuration
+        self._llm_model: str = (context.get("modelName") if context else None) or os.getenv("MODEL_NAME", MODEL_NAME)
+        self._llm_api_key: str | None = (context.get("apiKey") if context else None)
+        logger.info(
+            "InterviewAgent initialized for session %s (model=%s, custom_api_key=%s)",
+            self._session_id,
+            self._llm_model,
+            bool(self._llm_api_key),
+        )
 
         # Calculate max duration and 5-minute warning threshold
         duration_min = None
@@ -728,11 +759,22 @@ class InterviewAgent(Agent):
 
         # 2.5 Early question re-display detection — fast-path for candidate asking where the question is
         QUESTION_QUERY_TRIGGERS = (
-            "where is the question", "where is the problem", "can't find the question",
-            "cannot find the question", "can't see the question", "cannot see the question",
-            "share the question", "show the question", "show me the question",
-            "send the question", "what is the question", "what's the question",
-            "not able to see", "unable to see", "where question"
+            "where is the question", "where's the question", "where is the problem", "where's the problem",
+            "where is it", "where's it", "where question", "where problem",
+            "can't find the question", "cannot find the question", "can't find the problem",
+            "can't see the question", "cannot see the question", "can't see the problem",
+            "don't see the question", "do not see the question", "dont see the question",
+            "can't see it", "cannot see it", "don't see it", "cant see it", "cant see",
+            "can't see", "cannot see", "can not see", "not able to see", "unable to see",
+            "not seeing", "not seeing any", "see nothing", "don't see anything", "dont see anything",
+            "no question", "no problem", "there is no question", "there's no question",
+            "nothing on screen", "nothing on my screen", "nothing on the screen",
+            "screen is empty", "screen is blank", "blank screen", "empty screen",
+            "not showing", "not visible", "isn't showing", "is not showing", "isn't visible", "is not visible",
+            "share the question", "show the question", "show me the question", "display the question",
+            "send the question", "what is the question", "what's the question", "what is the problem",
+            "what's the problem", "put it on my screen", "put the question on my screen",
+            "repeat the question", "i see no question", "cannot find it", "can't find it"
         )
         if any(trig in transcript.lower() for trig in QUESTION_QUERY_TRIGGERS):
             from questions import ALL_QUESTIONS
@@ -750,7 +792,12 @@ class InterviewAgent(Agent):
             self._speak_and_log(reassurance_msg, candidate_text=transcript)
             return
 
-        classification = check_message_relevance(transcript, self._memory.recent_turns)
+        classification = check_message_relevance(
+            transcript,
+            self._memory.recent_turns,
+            model_name=self._llm_model,
+            api_key=self._llm_api_key,
+        )
         logger.info("[MODERATION] session=%s classification=%s text=%r", self._session_id, classification, transcript)
 
         # 3. Moderation Escalation Handling
@@ -883,14 +930,18 @@ class InterviewAgent(Agent):
                 },
             ]
 
-            response = await litellm.acompletion(
-                model=MODEL_NAME,
-                messages=full_messages,
-                temperature=0.7,
-                max_tokens=350,
-                stream=True,
-                tools=tools_list,
-            )
+            acompletion_kwargs = {
+                "model": self._llm_model,
+                "messages": full_messages,
+                "temperature": 0.7,
+                "max_tokens": 350,
+                "stream": True,
+                "tools": tools_list,
+            }
+            if self._llm_api_key:
+                acompletion_kwargs["api_key"] = self._llm_api_key
+
+            response = await litellm.acompletion(**acompletion_kwargs)
 
             full_text_container: list[str] = []
             tool_calls_container: list[dict] = []
@@ -903,11 +954,77 @@ class InterviewAgent(Agent):
                 full_generated_text_container=full_text_container,
             )
 
-            # Await playout of generated response before evaluating tool calls
-            try:
-                await handle.wait_for_playout()
-            except Exception:
-                pass
+            # Helper to resolve question from text or ID
+            def _resolve_question_text(raw_text: str) -> str | None:
+                if not raw_text or not raw_text.strip():
+                    return None
+                from questions import ALL_QUESTIONS
+                clean = raw_text.strip()
+                if clean in ALL_QUESTIONS:
+                    return ALL_QUESTIONS[clean]["body"]
+                clean_lower = clean.lower()
+                for q_id, q_info in ALL_QUESTIONS.items():
+                    if q_info["title"].lower() in clean_lower or q_id.lower() in clean_lower:
+                        return q_info["body"]
+                return None
+
+            # Immediate show_coding_question handling (do NOT block on TTS playout)
+            coding_question_shown = False
+            for tc in tool_calls_container:
+                if tc.get("name") == "show_coding_question":
+                    args_raw = tc.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except Exception:
+                        args = {}
+                    q_arg = args.get("question_text", "").strip()
+                    resolved_q = _resolve_question_text(q_arg)
+                    if not resolved_q:
+                        if full_text_container and full_text_container[0].strip():
+                            resolved_q = _resolve_question_text(full_text_container[0])
+                    if not resolved_q and q_arg:
+                        resolved_q = q_arg
+                    if not resolved_q:
+                        from questions import ALL_QUESTIONS
+                        resolved_q = ALL_QUESTIONS["E1"]["body"]
+
+                    logger.info("[IMMEDIATE TOOL CALL] Dispatching show_coding_question for session %s: %r", self._session_id, resolved_q[:80])
+                    await show_coding_question(question_text=resolved_q, context=self._get_tool_context())
+                    coding_question_shown = True
+
+            # Auto-detection fallback: if no tool call was emitted, but agent's response indicates introducing a coding problem
+            if not coding_question_shown:
+                spoken_text = full_text_container[0] if (full_text_container and full_text_container[0]) else ""
+                spoken_lower = spoken_text.lower()
+                ctx_dict = self._get_tool_context()
+                current_q = ctx_dict.get("current_question")
+
+                CODING_INTRO_KEYWORDS = (
+                    "coding question", "coding problem", "coding exercise", "coding portion",
+                    "code editor", "on your screen", "in your editor", "on the screen",
+                    "solve this problem", "problem statement", "write a function", "implement a function"
+                )
+                detected_q = _resolve_question_text(spoken_text)
+                has_coding_phrase = any(kw in spoken_lower for kw in CODING_INTRO_KEYWORDS)
+
+                if (detected_q or has_coding_phrase) and not current_q:
+                    from questions import ALL_QUESTIONS
+                    final_q = detected_q or ALL_QUESTIONS["E1"]["body"]
+                    logger.info("[AUTO-DETECT] Agent introduced coding round in spoken text without tool call. Auto-invoking show_coding_question for session %s.", self._session_id)
+                    await show_coding_question(question_text=final_q, context=ctx_dict)
+                    coding_question_shown = True
+
+            # If question was shown (via tool call or auto-detection) and model didn't speak any spoken text, speak transition
+            if coding_question_shown and (not full_text_container or not full_text_container[0].strip()):
+                transition_msg = (
+                    "I have displayed the coding question on your screen. "
+                    "Take your time to read through it, and write out your solution in the code editor."
+                )
+                h = self._speak_and_log(transition_msg)
+                try:
+                    await h.wait_for_playout()
+                except Exception:
+                    pass
 
             for tc in tool_calls_container:
                 func_name = tc.get("name", "")
@@ -920,7 +1037,6 @@ class InterviewAgent(Agent):
                         args = {}
                     reason = args.get("reason", "interview_complete")
                     logger.info("[TOOL CALL] Model invoked end_interview with reason: %s", reason)
-                    # If model didn't speak a closing message (empty text), speak one
                     if not full_text_container or not full_text_container[0].strip():
                         closing_msg = (
                             "Thank you for your time today. That concludes our interview session, "
@@ -931,6 +1047,11 @@ class InterviewAgent(Agent):
                             await h.wait_for_playout()
                         except Exception:
                             pass
+                    else:
+                        try:
+                            await handle.wait_for_playout()
+                        except Exception:
+                            pass
                     await self.end_interview_flow(reason)
                     return
 
@@ -939,57 +1060,17 @@ class InterviewAgent(Agent):
                     last_reply = self._memory.get_last_response()
                     if last_reply:
                         logger.info("[REPEAT] Replaying last agent response (%d chars) for session %s", len(last_reply), self._session_id)
-                        # Speak directly — no new LLM call, zero cost
                         self._speak_and_log(last_reply)
                     else:
                         logger.warning("[REPEAT] No prior response found in memory for session %s", self._session_id)
                         self._speak_and_log("I'm sorry, I don't have a previous response to repeat. Could you let me know what you'd like me to clarify?")
                     return
 
-                if func_name == "show_coding_question":
-                    args_raw = tc.get("arguments", "{}")
-                    try:
-                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                    except Exception:
-                        args = {}
-                    question_text = args.get("question_text", "").strip()
-
-                    from questions import ALL_QUESTIONS
-                    # If question_text is an ID like "E1", "M1", "H2", or title, resolve from ALL_QUESTIONS
-                    if question_text in ALL_QUESTIONS:
-                        question_text = ALL_QUESTIONS[question_text]["body"]
-                    else:
-                        for q_info in ALL_QUESTIONS.values():
-                            if q_info["title"].lower() in question_text.lower():
-                                question_text = q_info["body"]
-                                break
-
-                    # Fallback to spoken text if available
-                    if not question_text and full_text_container and full_text_container[0].strip():
-                        spoken = full_text_container[0].strip()
-                        if len(spoken) > 80 or "\n" in spoken:
-                            question_text = spoken
-
-                    # Final fallback: Two Sum (E1)
-                    if not question_text:
-                        question_text = ALL_QUESTIONS["E1"]["body"]
-
-                    logger.info("[TOOL CALL] Model invoked show_coding_question for session %s: %r", self._session_id, question_text[:80])
-                    await show_coding_question(question_text=question_text, context=self._get_tool_context())
-
-                    # If model didn't speak a transition message, announce the question aloud
-                    if not full_text_container or not full_text_container[0].strip():
-                        transition_msg = (
-                            "I have displayed the coding question on your screen. "
-                            "Take your time to read through it, and write out your solution in the code editor."
-                        )
-                        h = self._speak_and_log(transition_msg)
-                        try:
-                            await h.wait_for_playout()
-                        except Exception:
-                            pass
-
                 if func_name in ("get_current_code", "run_code_check"):
+                    try:
+                        await handle.wait_for_playout()
+                    except Exception:
+                        pass
                     logger.info("[TOOL CALL] Model invoked %s for session %s", func_name, self._session_id)
                     tool_result = ""
                     if func_name == "get_current_code":
@@ -1029,14 +1110,18 @@ class InterviewAgent(Agent):
                                 "content": tool_result,
                             },
                         ]
-                        fu_resp = await litellm.acompletion(
-                            model=MODEL_NAME,
-                            messages=follow_up_messages,
-                            temperature=0.7,
-                            max_tokens=350,
-                            stream=True,
-                            tools=tools_list,
-                        )
+                        fu_kwargs = {
+                            "model": self._llm_model,
+                            "messages": follow_up_messages,
+                            "temperature": 0.7,
+                            "max_tokens": 350,
+                            "stream": True,
+                            "tools": tools_list,
+                        }
+                        if self._llm_api_key:
+                            fu_kwargs["api_key"] = self._llm_api_key
+
+                        fu_resp = await litellm.acompletion(**fu_kwargs)
                         fu_full_text: list[str] = []
                         fu_tool_calls: list[dict] = []
                         fu_stream = _stream_llm_response(fu_resp, fu_full_text, fu_tool_calls)
@@ -1288,7 +1373,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 
     # Instantiate bounded working memory with local session log support (10 turn pairs window)
-    memory = ConversationMemory(window_size=10, session_id=session_id)
+    custom_api_key = context.get("apiKey") if context else None
+    memory = ConversationMemory(window_size=10, session_id=session_id, api_key=custom_api_key)
 
     # Configure interruption behavior with tuned thresholds and options
     # - allow_interruptions=True: Candidate can interrupt mid-question.

@@ -23,30 +23,60 @@ class ResumeService:
             cleaned = cleaned[:-3].strip()
         return cleaned.strip()
 
-    async def normalize_resume(self, raw_text: str) -> dict:
+    def _resolve_model_and_key(
+        self,
+        api_key: str | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
+    ) -> tuple[str, str | None]:
+        if provider and model_name and "/" not in model_name:
+            resolved_model = f"{provider.lower().strip()}/{model_name.strip()}"
+        elif model_name:
+            resolved_model = model_name.strip()
+        else:
+            resolved_model = os.getenv("MODEL_NAME", MODEL_NAME)
+
+        resolved_key = (
+            api_key
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("GROQ_API_KEY")
+            or os.getenv("ANTHROPIC_API_KEY")
+        )
+        return resolved_model, resolved_key
+
+    async def normalize_resume(
+        self,
+        raw_text: str,
+        api_key: str | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
+    ) -> dict:
         if not raw_text or len(raw_text) < 50:
             raise HTTPException(
                 status_code=400,
                 detail="rawText must be at least 50 characters long"
             )
 
-        model_name = os.getenv("MODEL_NAME", MODEL_NAME)
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
+        model_to_use, resolved_api_key = self._resolve_model_and_key(
+            api_key=api_key, provider=provider, model_name=model_name
+        )
+
+        if not resolved_api_key:
             raise HTTPException(
                 status_code=502,
-                detail="LLM normalization failed"
+                detail="LLM normalization failed: Missing API key"
             )
 
         try:
             response = await acompletion(
-                model=model_name,
+                model=model_to_use,
                 messages=[
                     {"role": "system", "content": RESUME_ANALYSIS_SYSTEM_PROMPT},
                     {"role": "user", "content": raw_text},
                 ],
                 temperature=0.0,
-                api_key=api_key,
+                api_key=resolved_api_key,
             )
             content = response.choices[0].message.content or ""
             cleaned = self.strip_code_fences(content)
@@ -84,7 +114,13 @@ class ResumeService:
             )
 
     async def check_relevance(
-        self, resume_text: str, job_title: str, suitable_roles: list[str] | None = None
+        self,
+        resume_text: str,
+        job_title: str,
+        suitable_roles: list[str] | None = None,
+        api_key: str | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
     ) -> dict:
         if not resume_text or not job_title:
             return {
@@ -103,10 +139,11 @@ class ResumeService:
                         "reason": f"Your resume aligns well with {job_title} positions based on your verified skills."
                     }
 
-        model_name = os.getenv("MODEL_NAME", MODEL_NAME)
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        model_to_use, resolved_api_key = self._resolve_model_and_key(
+            api_key=api_key, provider=provider, model_name=model_name
+        )
 
-        if not api_key:
+        if not resolved_api_key:
             print("[ResumeService LLM Error] Missing API key for check_relevance, failing open")
             return {
                 "relevant": True,
@@ -120,12 +157,12 @@ class ResumeService:
 
         try:
             response = await acompletion(
-                model=model_name,
+                model=model_to_use,
                 messages=[
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
-                api_key=api_key,
+                api_key=resolved_api_key,
             )
             content = response.choices[0].message.content or ""
             print(f"[ResumeService LLM Relevance Response]:\n{content}")

@@ -40,6 +40,17 @@ async def dispatch_agent(request: Request):
     # Normalize URL: livekit.api needs http:// not ws://
     http_url = livekit_url.replace("ws://", "http://").replace("wss://", "https://")
 
+    custom_api_key = data.get("api_key") or data.get("apiKey")
+    provider = data.get("provider") or data.get("llm_provider") or data.get("llmProvider")
+    model_name = data.get("model_name") or data.get("modelName") or data.get("model")
+
+    if provider and model_name and "/" not in model_name:
+        resolved_model = f"{provider.lower().strip()}/{model_name.strip()}"
+    elif model_name:
+        resolved_model = model_name.strip()
+    else:
+        resolved_model = None
+
     meta_dict = {
         "sessionId": target_session_id,
         "candidateName": data.get("candidate_name") or data.get("candidateName") or "Candidate",
@@ -49,6 +60,13 @@ async def dispatch_agent(request: Request):
         "resumeText": data.get("resume_text") or data.get("resumeText") or "",
         "durationMinutes": data.get("duration_minutes") or data.get("durationMinutes") or data.get("max_interview_minutes") or data.get("maxInterviewMinutes"),
     }
+    if custom_api_key:
+        meta_dict["apiKey"] = str(custom_api_key).strip()
+    if provider:
+        meta_dict["provider"] = str(provider).strip()
+    if resolved_model:
+        meta_dict["modelName"] = resolved_model
+
     metadata_str = json.dumps(meta_dict)
 
     try:

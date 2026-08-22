@@ -12,7 +12,14 @@ router = APIRouter(prefix="/resume", tags=["Resume"])
 
 @router.post("/normalize", response_model=ResumeNormalizeResponse)
 async def normalize_resume(request: ResumeNormalizeRequest):
-    res = await resume_service.normalize_resume(request.rawText)
+    custom_api_key = request.apiKey or request.api_key
+    model_name = request.modelName or request.model_name or request.model
+    res = await resume_service.normalize_resume(
+        request.rawText,
+        api_key=custom_api_key,
+        provider=request.provider,
+        model_name=model_name,
+    )
     return ResumeNormalizeResponse(
         cleanedText=res.get("cleanedText", ""),
         candidateName=res.get("candidateName"),
@@ -25,8 +32,15 @@ async def normalize_resume(request: ResumeNormalizeRequest):
 
 @router.post("/check-relevance", response_model=ResumeCheckRelevanceResponse)
 async def check_relevance(request: ResumeCheckRelevanceRequest):
+    custom_api_key = request.apiKey or request.api_key
+    model_name = request.modelName or request.model_name or request.model
     res = await resume_service.check_relevance(
-        request.resumeText, request.jobTitle, request.suitableRoles
+        request.resumeText,
+        request.jobTitle,
+        request.suitableRoles,
+        api_key=custom_api_key,
+        provider=request.provider,
+        model_name=model_name,
     )
     return ResumeCheckRelevanceResponse(relevant=res["relevant"], reason=res["reason"])
 

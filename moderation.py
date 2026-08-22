@@ -27,7 +27,12 @@ INAPPROPRIATE_TRIGGERS = {
 }
 
 
-def check_message_relevance(latest_message: str, recent_turns: list | None = None) -> str:
+def check_message_relevance(
+    latest_message: str,
+    recent_turns: list | None = None,
+    model_name: str | None = None,
+    api_key: str | None = None,
+) -> str:
     """
     Classify latest candidate turn into NORMAL, OFF_TOPIC, or INAPPROPRIATE.
     Uses fast local heuristic checks first to save LLM API quota on standard interview turns.
@@ -44,7 +49,7 @@ def check_message_relevance(latest_message: str, recent_turns: list | None = Non
     if not has_off_topic and not has_inappropriate:
         return "NORMAL"
 
-    model_name = os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
+    resolved_model = model_name or os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
 
     context_snippet = ""
     if recent_turns:
@@ -59,12 +64,16 @@ def check_message_relevance(latest_message: str, recent_turns: list | None = Non
     ]
 
     try:
-        response = litellm.completion(
-            model=model_name,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=10,
-        )
+        completion_kwargs = {
+            "model": resolved_model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 10,
+        }
+        if api_key:
+            completion_kwargs["api_key"] = api_key
+
+        response = litellm.completion(**completion_kwargs)
         raw_content = response.choices[0].message.content or ""
         classification = raw_content.strip().upper()
 
