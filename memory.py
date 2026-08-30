@@ -16,7 +16,21 @@ CONVERSATIONS_DIR = Path(__file__).parent / "conversations"
 DEFAULT_WINDOW_SIZE = 10
 DEFAULT_BATCH_FOLD_SIZE = 3
 DEFAULT_MAX_RECENT_TOKENS = 3000
-SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL") or "groq/llama-3.1-8b-instant"
+LOCAL_LLM = os.getenv("LOCAL_LLM", "false").lower() in ("true", "1", "yes")
+DEFAULT_SUMMARIZATION_MODEL = "ollama/qwen3.5:9b" if LOCAL_LLM else "groq/llama-3.1-8b-instant"
+SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL") or DEFAULT_SUMMARIZATION_MODEL
+
+
+def normalize_litellm_model(model_name: str) -> str:
+    """Normalize model string for LiteLLM (e.g. ollama/qwen3.5:9b -> ollama_chat/qwen3.5:9b)."""
+    if not model_name:
+        return model_name
+    model_str = str(model_name).strip()
+    if model_str.lower().startswith("ollama/") and not model_str.lower().startswith("ollama_chat/"):
+        return "ollama_chat/" + model_str[len("ollama/"):]
+    return model_str
+
+
 
 
 class ConversationMemory:
@@ -187,20 +201,24 @@ class ConversationMemory:
         prompt = SUMMARIZE_INSTRUCTION.format(exchange_text=exchange_text)
 
         start_time = time.perf_counter()
+        provider_tag = "Ollama" if "ollama" in self.summarization_model.lower() else "Groq" if "groq" in self.summarization_model.lower() else "LLM"
         logger.info(
-            "[MEMORY FOLD TRIGGERED] session=%s reason=%s batch_size=%d model=%s (Groq)",
+            "[MEMORY FOLD TRIGGERED] session=%s reason=%s batch_size=%d model=%s (%s)",
             self.session_id,
             reason,
             len(batch_to_fold),
             self.summarization_model,
+            provider_tag,
         )
 
         try:
+            is_ollama = "ollama" in self.summarization_model.lower()
+
             acompletion_kwargs = {
-                "model": self.summarization_model,
+                "model": normalize_litellm_model(self.summarization_model),
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 200,
+                "max_tokens": 500 if is_ollama else 200,
             }
             if self.api_key:
                 acompletion_kwargs["api_key"] = self.api_key
@@ -209,16 +227,18 @@ class ConversationMemory:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             summary = response.choices[0].message.content.strip()
 
+
             if summary:
                 self.summary_bullets.append(summary)
                 self._rebuild_rolling_summary()
                 logger.info(
-                    "[MEMORY FOLD COMPLETED] session=%s reason=%s duration=%.2fms model=%s (Groq confirmed) "
+                    "[MEMORY FOLD COMPLETED] session=%s reason=%s duration=%.2fms model=%s (%s) "
                     "summarized_%d_pairs summary_bullets=%d",
                     self.session_id,
                     reason,
                     elapsed_ms,
                     self.summarization_model,
+                    provider_tag,
                     len(batch_to_fold),
                     len(self.summary_bullets),
                 )

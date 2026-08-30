@@ -1,12 +1,15 @@
 import json
 import logging
 import os
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from livekit import api
+from app.dependencies import verify_internal_key
 
 logger = logging.getLogger("dispatch-controller")
 
-router = APIRouter(tags=["Dispatch"])
+# All routes in this router require a valid X-Internal-Api-Key header.
+# /dispatch-agent is a server-to-server endpoint called by the Spring Boot backend only.
+router = APIRouter(tags=["Dispatch"], dependencies=[Depends(verify_internal_key)])
 
 
 @router.post("/dispatch-agent")
@@ -14,6 +17,7 @@ async def dispatch_agent(request: Request):
     """
     Dispatch the 'interview-agent' LiveKit worker to a specific room.
     Reads request body directly to prevent 422 validation errors.
+    Protected by X-Internal-Api-Key — not open to public internet.
     """
     try:
         body_bytes = await request.body()
@@ -34,8 +38,8 @@ async def dispatch_agent(request: Request):
         )
 
     livekit_url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
-    api_key = os.getenv("LIVEKIT_API_KEY", "devkey")
-    api_secret = os.getenv("LIVEKIT_API_SECRET", "secret")
+    api_key = os.getenv("LIVEKIT_API_KEY")  # Must be set in env
+    api_secret = os.getenv("LIVEKIT_API_SECRET")  # Must be set in env
 
     # Normalize URL: livekit.api needs http:// not ws://
     http_url = livekit_url.replace("ws://", "http://").replace("wss://", "https://")
@@ -48,8 +52,12 @@ async def dispatch_agent(request: Request):
         resolved_model = f"{provider.lower().strip()}/{model_name.strip()}"
     elif model_name:
         resolved_model = model_name.strip()
+    elif local_llm:
+        resolved_model = os.getenv("MODEL_NAME", "ollama/qwen3.5:9b")
     else:
         resolved_model = None
+
+
 
     meta_dict = {
         "sessionId": target_session_id,

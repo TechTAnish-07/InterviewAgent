@@ -36,14 +36,19 @@ class ResumeService:
         else:
             resolved_model = os.getenv("MODEL_NAME", MODEL_NAME)
 
-        resolved_key = (
-            api_key
-            or os.getenv("GEMINI_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
-        )
+        if resolved_model.lower().startswith("ollama/"):
+            resolved_key = None
+        else:
+            resolved_key = (
+                api_key
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("GROQ_API_KEY")
+                or os.getenv("ANTHROPIC_API_KEY")
+            )
         return resolved_model, resolved_key
+
+
 
     async def normalize_resume(
         self,
@@ -62,22 +67,25 @@ class ResumeService:
             api_key=api_key, provider=provider, model_name=model_name
         )
 
-        if not resolved_api_key:
+        if not resolved_api_key and not model_to_use.lower().startswith("ollama/"):
             raise HTTPException(
                 status_code=502,
-                detail="LLM normalization failed: Missing API key"
+                detail="LLM normalization failed"
             )
 
         try:
-            response = await acompletion(
-                model=model_to_use,
-                messages=[
+            comp_kwargs = {
+                "model": model_to_use,
+                "messages": [
                     {"role": "system", "content": RESUME_ANALYSIS_SYSTEM_PROMPT},
                     {"role": "user", "content": raw_text},
                 ],
-                temperature=0.0,
-                api_key=resolved_api_key,
-            )
+                "temperature": 0.0,
+            }
+            if resolved_api_key:
+                comp_kwargs["api_key"] = resolved_api_key
+
+            response = await acompletion(**comp_kwargs)
             content = response.choices[0].message.content or ""
             cleaned = self.strip_code_fences(content)
             print(f"[ResumeService LLM Response Output]:\n{cleaned}")
@@ -143,7 +151,7 @@ class ResumeService:
             api_key=api_key, provider=provider, model_name=model_name
         )
 
-        if not resolved_api_key:
+        if not resolved_api_key and not model_to_use.lower().startswith("ollama/"):
             print("[ResumeService LLM Error] Missing API key for check_relevance, failing open")
             return {
                 "relevant": True,
@@ -156,14 +164,18 @@ class ResumeService:
         )
 
         try:
-            response = await acompletion(
-                model=model_to_use,
-                messages=[
+            comp_kwargs = {
+                "model": model_to_use,
+                "messages": [
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.0,
-                api_key=resolved_api_key,
-            )
+                "temperature": 0.0,
+            }
+            if resolved_api_key:
+                comp_kwargs["api_key"] = resolved_api_key
+
+            response = await acompletion(**comp_kwargs)
+
             content = response.choices[0].message.content or ""
             print(f"[ResumeService LLM Relevance Response]:\n{content}")
 

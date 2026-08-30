@@ -35,6 +35,7 @@ async def _stream_llm_response(
     accumulated_text: list[str] = []
     accumulated_tool_calls: dict[int, dict] = {}
     word_buffer: str = ""
+    in_think_block: bool = False
     try:
         async for chunk in response_stream:
             if not chunk or not getattr(chunk, "choices", None):
@@ -42,6 +43,16 @@ async def _stream_llm_response(
             delta = chunk.choices[0].delta
             content = getattr(delta, "content", None)
             if content:
+                # Handle possible thinking tokens from reasoning models (e.g. Qwen / DeepSeek)
+                if "<think>" in content:
+                    in_think_block = True
+                    content = content.split("<think>")[0]
+                if "</think>" in content:
+                    in_think_block = False
+                    content = content.split("</think>")[-1]
+                if in_think_block:
+                    continue
+
                 content_clean = content.replace("*", "").replace("#", "").replace("`", "")
                 if content_clean:
                     accumulated_text.append(content_clean)
@@ -59,7 +70,13 @@ async def _stream_llm_response(
                 for tc in t_calls:
                     idx = getattr(tc, "index", 0) or 0
                     if idx not in accumulated_tool_calls:
-                        accumulated_tool_calls[idx] = {"name": "", "arguments": ""}
+                        accumulated_tool_calls[idx] = {
+                            "name": "",
+                            "arguments": "",
+                            "id": getattr(tc, "id", None) or f"call_{idx}",
+                        }
+                    if getattr(tc, "id", None):
+                        accumulated_tool_calls[idx]["id"] = tc.id
                     if hasattr(tc, "function") and tc.function:
                         if getattr(tc.function, "name", None):
                             accumulated_tool_calls[idx]["name"] += tc.function.name
@@ -81,6 +98,7 @@ async def _stream_llm_response(
     full_text_container.append(full_text)
     if accumulated_tool_calls:
         tool_calls_container.extend(accumulated_tool_calls.values())
+
 
 from memory import ConversationMemory
 from moderation import check_message_relevance
@@ -113,8 +131,66 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("interview-agent")
 
 SPRING_BASE_URL = os.getenv("SPRING_BASE_URL") or os.getenv("BACKEND_URL") or "http://localhost:8080"
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY") or "internal-secret-key"
-MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-3.5-flash"
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")  # Must be set in env; never hardcode a fallback
+LOCAL_LLM = os.getenv("LOCAL_LLM", "false").lower() in ("true", "1", "yes")
+DEFAULT_MODEL_NAME = "ollama/qwen3.5:9b" if LOCAL_LLM else "gemini/gemini-2.5-flash"
+MODEL_NAME = os.getenv("MODEL_NAME") or DEFAULT_MODEL_NAME
+
+
+def normalize_litellm_model(model_name: str) -> str:
+    """
+    Normalize model string for LiteLLM.
+    LiteLLM routes 'ollama_chat/' to Ollama's /api/chat endpoint with full tool calling and streaming support.
+    """
+    if not model_name:
+        return model_name
+    model_str = str(model_name).strip()
+    if model_str.lower().startswith("ollama/") and not model_str.lower().startswith("ollama_chat/"):
+        return "ollama_chat/" + model_str[len("ollama/"):]
+    return model_str
+
+
+def check_ollama_availability(model_name: str | None = None) -> tuple[bool, str]:
+    """
+    Lightweight check if Ollama server is reachable and target model is pulled.
+    """
+    model = model_name or MODEL_NAME
+    if not model or not ("ollama" in str(model).lower() or LOCAL_LLM):
+        return True, "Remote LLM configured"
+
+    ollama_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434").rstrip("/")
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"{ollama_base}/api/tags", headers={"User-Agent": "InterviewAgent"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                body = json.loads(resp.read().decode("utf-8"))
+                models = [m.get("name", "") for m in body.get("models", [])]
+                target_tag = model.split("/")[-1].lower()
+                matched = any(target_tag in m.lower() or target_tag.split(":")[0] in m.lower() for m in models)
+                if not matched and models:
+                    logger.warning(
+                        "[OLLAMA WARNING] Model '%s' was not explicitly found in local Ollama tags: %s. "
+                        "If you encounter errors, run: ollama pull %s",
+                        target_tag, models, target_tag,
+                    )
+                return True, f"Ollama available at {ollama_base} ({len(models)} models found)"
+    except Exception as e:
+        msg = (
+            f"\n{'!' * 70}\n"
+            f"[OLLAMA SERVER UNAVAILABLE]\n"
+            f"Local LLM is configured as '{model}', but the Ollama server is unreachable at {ollama_base}.\n"
+            f"Please make sure Ollama is running by starting it in a terminal:\n"
+            f"  ollama serve\n"
+            f"Or verify the model is pulled with:\n"
+            f"  ollama pull {model.split('/')[-1]}\n"
+            f"Error details: {e}\n"
+            f"{'!' * 70}\n"
+        )
+        logger.error(msg)
+        return False, msg
+    return True, "Ollama check passed"
+
 
 # Time and turn safety net limits (dynamic calculation based on total interview minutes)
 DEFAULT_MAX_INTERVIEW_MINUTES: int = int(os.getenv("MAX_INTERVIEW_MINUTES", os.getenv("HARD_TIME_LIMIT_SECONDS", 1800) // 60))  # Default 30 minutes
@@ -228,21 +304,30 @@ SESSION_CONTEXT_CACHE: dict[str, dict] = {}
 def log_llm_cost(call_site: str, model: str, response) -> None:
     """
     Print token usage and estimated USD cost for every LiteLLM completion call.
-    Uses litellm.completion_cost() for pricing (supports Gemini, OpenAI, etc.).
+    For local Ollama calls, logs $0.000000 USD while tracking actual token counts.
     """
     try:
-        usage = response.usage
+        usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
         completion_tokens = getattr(usage, "completion_tokens", 0) or 0
         total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
-        try:
-            cost_usd = litellm.completion_cost(completion_response=response)
-        except Exception:
+
+        is_local = "ollama" in str(model).lower() or LOCAL_LLM
+        if is_local:
             cost_usd = 0.0
+            provider_display = "Ollama (local)"
+        else:
+            try:
+                cost_usd = litellm.completion_cost(completion_response=response)
+            except Exception:
+                cost_usd = 0.0
+            provider_display = "Cloud API"
+
         sep = "\u2500" * 65
         print(
             f"\n{sep}\n"
             f"  \U0001f4b0 LLM COST LOG  [{call_site}]\n"
+            f"  Provider   : {provider_display}\n"
             f"  Model      : {model}\n"
             f"  Prompt     : {prompt_tokens:,} tokens\n"
             f"  Completion : {completion_tokens:,} tokens\n"
@@ -252,8 +337,8 @@ def log_llm_cost(call_site: str, model: str, response) -> None:
             flush=True,
         )
         logger.info(
-            "[COST] %s | model=%s prompt=%d completion=%d total=%d cost=$%.6f",
-            call_site, model, prompt_tokens, completion_tokens, total_tokens, cost_usd,
+            "[COST] %s | provider=%s model=%s prompt=%d completion=%d total=%d cost=$%.6f",
+            call_site, provider_display, model, prompt_tokens, completion_tokens, total_tokens, cost_usd,
         )
     except Exception as e:
         logger.warning("Cost logging failed for %s: %s", call_site, e)
@@ -300,8 +385,11 @@ def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
                     resolved_model = f"{str(provider).lower().strip()}/{str(model_name).strip()}"
                 elif model_name:
                     resolved_model = str(model_name).strip()
+                elif LOCAL_LLM:
+                    resolved_model = os.getenv("MODEL_NAME", MODEL_NAME)
                 else:
                     resolved_model = None
+
 
                 return {
                     "candidateName": c_name,
@@ -315,12 +403,14 @@ def extract_context_from_metadata(metadata_raw: str | None) -> dict | None:
                     "provider": str(provider).strip() if provider else None,
                     "modelName": resolved_model,
                 }
+
     except Exception:
         pass
     return None
 
 
 async def fetch_interview_context(session_id: str) -> dict | None:
+
     """
     Fetch interview context (candidateName, resumeText, jobTitle/jobRole) from Spring Boot backend.
     GET {SPRING_BASE_URL}/api/ai-interview/{sessionId}/context
@@ -450,19 +540,25 @@ async def generate_and_save_feedback(
         {"role": "user", "content": prompt},
     ]
 
-    model_to_use = (context.get("modelName") if context else None) or os.getenv("MODEL_NAME", MODEL_NAME)
-    custom_api_key = (context.get("apiKey") if context else None)
+    if LOCAL_LLM:
+        model_to_use = os.getenv("MODEL_NAME", MODEL_NAME)
+        custom_api_key = None
+    else:
+        model_to_use = (context.get("modelName") if context else None) or os.getenv("MODEL_NAME", MODEL_NAME)
+        custom_api_key = (context.get("apiKey") if context else None)
 
     try:
         logger.info("Generating feedback report for session %s (model: %s)...", session_id, model_to_use)
+        is_ollama = "ollama" in model_to_use.lower()
         comp_kwargs = {
-            "model": model_to_use,
+            "model": normalize_litellm_model(model_to_use),
             "messages": messages,
             "temperature": 0.4,
-            "max_tokens": 1200,
+            "max_tokens": 1500 if is_ollama else 1200,
         }
         if custom_api_key:
             comp_kwargs["api_key"] = custom_api_key
+
 
         response = litellm.completion(**comp_kwargs)
         log_llm_cost("FEEDBACK_GEN", model_to_use, response)
@@ -510,14 +606,20 @@ class InterviewAgent(Agent):
         self._is_processing_turn: bool = False
 
         # Model and API key configuration
-        self._llm_model: str = (context.get("modelName") if context else None) or os.getenv("MODEL_NAME", MODEL_NAME)
-        self._llm_api_key: str | None = (context.get("apiKey") if context else None)
+        if LOCAL_LLM:
+            self._llm_model: str = os.getenv("MODEL_NAME", MODEL_NAME)
+            self._llm_api_key: str | None = None
+        else:
+            self._llm_model: str = (context.get("modelName") if context else None) or os.getenv("MODEL_NAME", MODEL_NAME)
+            self._llm_api_key: str | None = (context.get("apiKey") if context else None)
         logger.info(
-            "InterviewAgent initialized for session %s (model=%s, custom_api_key=%s)",
+            "InterviewAgent initialized for session %s (model=%s, custom_api_key=%s, local=%s)",
             self._session_id,
             self._llm_model,
             bool(self._llm_api_key),
+            LOCAL_LLM or "ollama" in str(self._llm_model).lower(),
         )
+
 
         # Calculate max duration and 5-minute warning threshold
         duration_min = None
@@ -624,8 +726,8 @@ class InterviewAgent(Agent):
         room_name = getattr(self._room, "name", None)
         if room_name and not isinstance(room_name, type(None)):
             livekit_url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
-            api_key = os.getenv("LIVEKIT_API_KEY", "devkey")
-            api_secret = os.getenv("LIVEKIT_API_SECRET", "secret")
+            api_key = os.getenv("LIVEKIT_API_KEY")  # Must be set in env
+            api_secret = os.getenv("LIVEKIT_API_SECRET")  # Must be set in env
             http_url = livekit_url.replace("ws://", "http://").replace("wss://", "https://")
             try:
                 lk_api = api.LiveKitAPI(http_url, api_key, api_secret)
@@ -930,16 +1032,18 @@ class InterviewAgent(Agent):
                 },
             ]
 
+            is_ollama = "ollama" in self._llm_model.lower()
             acompletion_kwargs = {
-                "model": self._llm_model,
+                "model": normalize_litellm_model(self._llm_model),
                 "messages": full_messages,
                 "temperature": 0.7,
-                "max_tokens": 350,
+                "max_tokens": 1000 if is_ollama else 350,
                 "stream": True,
                 "tools": tools_list,
             }
             if self._llm_api_key:
                 acompletion_kwargs["api_key"] = self._llm_api_key
+
 
             response = await litellm.acompletion(**acompletion_kwargs)
 
@@ -1111,15 +1215,16 @@ class InterviewAgent(Agent):
                             },
                         ]
                         fu_kwargs = {
-                            "model": self._llm_model,
+                            "model": normalize_litellm_model(self._llm_model),
                             "messages": follow_up_messages,
                             "temperature": 0.7,
-                            "max_tokens": 350,
+                            "max_tokens": 1000 if is_ollama else 350,
                             "stream": True,
                             "tools": tools_list,
                         }
                         if self._llm_api_key:
                             fu_kwargs["api_key"] = self._llm_api_key
+
 
                         fu_resp = await litellm.acompletion(**fu_kwargs)
                         fu_full_text: list[str] = []
@@ -1165,32 +1270,42 @@ class InterviewAgent(Agent):
     def _accumulate_cost(self, response) -> None:
         """Accumulate token usage and cost across all LLM calls for this session."""
         try:
-            usage = response.usage
+            usage = getattr(response, "usage", None)
             self._total_prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
             self._total_completion_tokens += getattr(usage, "completion_tokens", 0) or 0
-            self._total_cost_usd += litellm.completion_cost(completion_response=response)
+            is_local = "ollama" in str(self._llm_model).lower() or LOCAL_LLM
+            if not is_local:
+                try:
+                    self._total_cost_usd += litellm.completion_cost(completion_response=response)
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def log_session_cost_summary(self) -> None:
         """Print cumulative token usage and cost for the entire session."""
         total_tokens = self._total_prompt_tokens + self._total_completion_tokens
+        is_local = "ollama" in str(self._llm_model).lower() or LOCAL_LLM
+        cost_str = "$0.000000 USD (Local Ollama)" if is_local else f"${self._total_cost_usd:.6f} USD"
         sep = "\u2550" * 65
         print(
             f"\n{sep}\n"
             f"  \U0001f4ca SESSION COST SUMMARY (Session: {self._session_id})\n"
+            f"  Provider                : {'Ollama (local)' if is_local else 'Cloud API'}\n"
+            f"  Model                   : {self._llm_model}\n"
             f"  Total Prompt Tokens     : {self._total_prompt_tokens:,}\n"
             f"  Total Completion Tokens : {self._total_completion_tokens:,}\n"
             f"  Total Tokens            : {total_tokens:,}\n"
-            f"  Total Estimated Cost    : ${self._total_cost_usd:.6f} USD\n"
+            f"  Total Estimated Cost    : {cost_str}\n"
             f"{sep}\n",
             flush=True,
         )
         logger.info(
-            "[SESSION COST] session=%s prompt=%d completion=%d total=%d cost=$%.6f",
-            self._session_id, self._total_prompt_tokens, self._total_completion_tokens,
-            total_tokens, self._total_cost_usd,
+            "[SESSION COST] session=%s is_local=%s model=%s prompt=%d completion=%d total=%d cost=$%.6f",
+            self._session_id, is_local, self._llm_model, self._total_prompt_tokens, self._total_completion_tokens,
+            total_tokens, 0.0 if is_local else self._total_cost_usd,
         )
+
 
     def _speak_and_log(
         self,
@@ -1594,6 +1709,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 
 if __name__ == "__main__":
+    # Run preflight check for Ollama if configured
+    if LOCAL_LLM or "ollama" in MODEL_NAME.lower():
+        ok, msg = check_ollama_availability(MODEL_NAME)
+        if not ok:
+            logger.warning("[STARTUP WARNING] %s", msg)
+        else:
+            logger.info("[STARTUP] %s", msg)
+
     agent_name = os.getenv("AGENT_NAME") or "interview-agent"
     logger.info("Starting LiveKit worker registered as agent_name: '%s' (explicit dispatch enabled)", agent_name)
     agents.cli.run_app(
@@ -1603,3 +1726,4 @@ if __name__ == "__main__":
             host="127.0.0.1",
         )
     )
+

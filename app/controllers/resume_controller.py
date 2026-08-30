@@ -1,4 +1,5 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from app.dependencies import verify_internal_key
 from app.schemas.resume_schema import (
     ResumeNormalizeRequest,
     ResumeNormalizeResponse,
@@ -7,7 +8,13 @@ from app.schemas.resume_schema import (
 )
 from app.services.resume_service import resume_service
 
-router = APIRouter(prefix="/resume", tags=["Resume"])
+# All routes in this router require a valid X-Internal-Api-Key header.
+# /resume/* endpoints are called server-to-server from Spring Boot only — not browser-facing.
+router = APIRouter(
+    prefix="/resume",
+    tags=["Resume"],
+    dependencies=[Depends(verify_internal_key)],
+)
 
 
 @router.post("/normalize", response_model=ResumeNormalizeResponse)
@@ -43,4 +50,3 @@ async def check_relevance(request: ResumeCheckRelevanceRequest):
         model_name=model_name,
     )
     return ResumeCheckRelevanceResponse(relevant=res["relevant"], reason=res["reason"])
-

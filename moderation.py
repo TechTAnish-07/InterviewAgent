@@ -27,7 +27,17 @@ INAPPROPRIATE_TRIGGERS = {
 }
 
 
+def normalize_litellm_model(model_name: str) -> str:
+    if not model_name:
+        return model_name
+    model_str = str(model_name).strip()
+    if model_str.lower().startswith("ollama/") and not model_str.lower().startswith("ollama_chat/"):
+        return "ollama_chat/" + model_str[len("ollama/"):]
+    return model_str
+
+
 def check_message_relevance(
+
     latest_message: str,
     recent_turns: list | None = None,
     model_name: str | None = None,
@@ -49,7 +59,10 @@ def check_message_relevance(
     if not has_off_topic and not has_inappropriate:
         return "NORMAL"
 
-    resolved_model = model_name or os.getenv("MODEL_NAME") or "gemini/gemini-2.5-flash"
+
+    LOCAL_LLM = os.getenv("LOCAL_LLM", "false").lower() in ("true", "1", "yes")
+    default_model = "ollama/qwen3.5:9b" if LOCAL_LLM else "gemini/gemini-2.5-flash"
+    resolved_model = model_name or os.getenv("MODEL_NAME") or default_model
 
     context_snippet = ""
     if recent_turns:
@@ -64,14 +77,17 @@ def check_message_relevance(
     ]
 
     try:
+
+        is_ollama = "ollama" in resolved_model.lower()
         completion_kwargs = {
-            "model": resolved_model,
+            "model": normalize_litellm_model(resolved_model),
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 10,
+            "max_tokens": 300 if is_ollama else 10,
         }
         if api_key:
             completion_kwargs["api_key"] = api_key
+
 
         response = litellm.completion(**completion_kwargs)
         raw_content = response.choices[0].message.content or ""
