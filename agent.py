@@ -113,7 +113,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("interview-agent")
 
 SPRING_BASE_URL = os.getenv("SPRING_BASE_URL") or os.getenv("BACKEND_URL") or "http://localhost:8080"
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY") or "internal-secret-key"
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+if not INTERNAL_API_KEY:
+    logger.critical("INTERNAL_API_KEY environment variable is not set. Exiting startup.")
+    raise RuntimeError("INTERNAL_API_KEY environment variable is required but not set.")
 MODEL_NAME = os.getenv("MODEL_NAME") or "gemini/gemini-3.5-flash"
 
 # Time and turn safety net limits (dynamic calculation based on total interview minutes)
@@ -464,7 +467,7 @@ async def generate_and_save_feedback(
         if custom_api_key:
             comp_kwargs["api_key"] = custom_api_key
 
-        response = litellm.completion(**comp_kwargs)
+        response = await litellm.acompletion(**comp_kwargs)
         log_llm_cost("FEEDBACK_GEN", model_to_use, response)
         feedback_text = response.choices[0].message.content.strip()
         logger.info("Feedback report generated for session %s. Saving to Spring Boot...", session_id)
@@ -539,6 +542,90 @@ class InterviewAgent(Agent):
         self._watchdog_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
 
+        self._tools_list = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "end_interview",
+                    "description": end_interview.info.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Reason for ending interview (e.g. interview_complete)",
+                            }
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "repeat_last_response",
+                    "description": repeat_last_response.info.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Reason for repeating the last response",
+                            }
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "show_coding_question",
+                    "description": show_coding_question.info.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question_text": {
+                                "type": "string",
+                                "description": "The coding question problem statement to display on the candidate's screen.",
+                            }
+                        },
+                        "required": ["question_text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_code",
+                    "description": get_current_code.info.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_code_check",
+                    "description": run_code_check.info.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "language": {
+                                "type": "string",
+                                "description": "The programming language of the code (e.g. python, javascript, java, cpp)",
+                            },
+                            "stdin": {
+                                "type": "string",
+                                "description": "Optional standard input to feed to the program",
+                            },
+                        },
+                        "required": ["language"],
+                    },
+                },
+            },
+        ]
+
     def _safe_interrupt(self) -> None:
         """Safely interrupt the current speech session without throwing if uninitialized."""
         try:
@@ -594,6 +681,7 @@ class InterviewAgent(Agent):
         if self._is_ending:
             return
         self._is_ending = True
+        SESSION_CONTEXT_CACHE.pop(str(self._session_id), None)
         if self._watchdog_task and not self._watchdog_task.done():
             self._watchdog_task.cancel()
         logger.info("Executing end_interview_flow for session %s (reason: %s)...", self._session_id, reason)
@@ -639,7 +727,7 @@ class InterviewAgent(Agent):
         try:
             await self._room.disconnect()
         except Exception as e:
-            logger.warn("Error disconnecting room for session %s: %s", self._session_id, e)
+            logger.warning("Error disconnecting room for session %s: %s", self._session_id, e)
 
     async def generate_greeting(self) -> str:
         """
@@ -792,7 +880,7 @@ class InterviewAgent(Agent):
             self._speak_and_log(reassurance_msg, candidate_text=transcript)
             return
 
-        classification = check_message_relevance(
+        classification = await check_message_relevance(
             transcript,
             self._memory.recent_turns,
             model_name=self._llm_model,
@@ -801,7 +889,7 @@ class InterviewAgent(Agent):
         logger.info("[MODERATION] session=%s classification=%s text=%r", self._session_id, classification, transcript)
 
         # 3. Moderation Escalation Handling
-        if classification in ("OFF_TOPIC", "INAPPROAPPROPRIATE", "INAPPROPRIATE"):
+        if classification in ("OFF_TOPIC", "INAPPROPRIATE"):
             warning_count = self._record_warning(classification)
 
             if warning_count == 1:
@@ -838,6 +926,9 @@ class InterviewAgent(Agent):
                 WARNING_WINDOW_SECONDS,
             )
 
+        if self._memory.rolling_summary:
+            system_content += f"\n\n[PRIOR CONVERSATION SUMMARY]\n{self._memory.rolling_summary}"
+
         context_messages = self._memory.build_context_messages()
         full_messages = [
             {"role": "system", "content": system_content},
@@ -846,102 +937,20 @@ class InterviewAgent(Agent):
         ]
 
         try:
-            tools_list = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "end_interview",
-                        "description": end_interview.info.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "reason": {
-                                    "type": "string",
-                                    "description": "Reason for ending interview (e.g. interview_complete)",
-                                }
-                            },
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "repeat_last_response",
-                        "description": repeat_last_response.info.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "reason": {
-                                    "type": "string",
-                                    "description": "Reason for repeating the last response",
-                                }
-                            },
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "show_coding_question",
-                        "description": show_coding_question.info.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "question_text": {
-                                    "type": "string",
-                                    "description": "The coding question problem statement to display on the candidate's screen.",
-                                }
-                            },
-                            "required": ["question_text"],
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_current_code",
-                        "description": get_current_code.info.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "run_code_check",
-                        "description": run_code_check.info.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "language": {
-                                    "type": "string",
-                                    "description": "The programming language of the code (e.g. python, javascript, java, cpp)",
-                                },
-                                "stdin": {
-                                    "type": "string",
-                                    "description": "Optional standard input to feed to the program",
-                                },
-                            },
-                            "required": ["language"],
-                        },
-                    },
-                },
-            ]
-
             acompletion_kwargs = {
                 "model": self._llm_model,
                 "messages": full_messages,
                 "temperature": 0.7,
                 "max_tokens": 350,
                 "stream": True,
-                "tools": tools_list,
+                "tools": self._tools_list,
+                "timeout": 30,
             }
             if self._llm_api_key:
                 acompletion_kwargs["api_key"] = self._llm_api_key
 
             response = await litellm.acompletion(**acompletion_kwargs)
+            self._accumulate_cost(response)
 
             full_text_container: list[str] = []
             tool_calls_container: list[dict] = []
@@ -1116,12 +1125,14 @@ class InterviewAgent(Agent):
                             "temperature": 0.7,
                             "max_tokens": 350,
                             "stream": True,
-                            "tools": tools_list,
+                            "tools": self._tools_list,
+                            "timeout": 30,
                         }
                         if self._llm_api_key:
                             fu_kwargs["api_key"] = self._llm_api_key
 
                         fu_resp = await litellm.acompletion(**fu_kwargs)
+                        self._accumulate_cost(fu_resp)
                         fu_full_text: list[str] = []
                         fu_tool_calls: list[dict] = []
                         fu_stream = _stream_llm_response(fu_resp, fu_full_text, fu_tool_calls)
@@ -1138,6 +1149,8 @@ class InterviewAgent(Agent):
         except asyncio.CancelledError:
             logger.info("[TURN CANCELLED] Turn processing task was cancelled for session %s.", self._session_id)
             raise
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            logger.error("Timeout during LLM completion for session %s: %s", self._session_id, e)
         except Exception as e:
             logger.error("Error in normal reply flow for session %s: %s", self._session_id, e)
             # Do NOT speak a canned background question as fallback — it causes the agent to
@@ -1201,7 +1214,8 @@ class InterviewAgent(Agent):
         """
         Helper to print, log, and speak reply via TTS.
         Supports both plain string text and streaming AsyncIterable[str] text streams.
-        Attaches a done callback to track speech completion, interruption, and memory updates.
+        Attaches a done callback to track speech completion and interruption.
+        Commits turn to memory at generation time rather than playout completion time.
         Ensures active speech handles are managed safely without race conditions.
         """
         # Interrupt any previous speech handle that is still active
@@ -1218,10 +1232,43 @@ class InterviewAgent(Agent):
             )
             print(formatted_response, flush=True)
             logger.info("[AGENT RESPONSE] session=%s: %s", self._session_id, text)
+            if candidate_text is not None:
+                summary_before = self._memory.rolling_summary
+                self._memory.add_turn(candidate_text, text)
+                summary_updated = self._memory.rolling_summary != summary_before
+                logger.info(
+                    "[TURN LOG] session=%s summary_updated=%s candidate=%r reply=%r",
+                    self._session_id,
+                    summary_updated,
+                    candidate_text,
+                    text,
+                )
+            say_target = text
         else:
             logger.info("[AGENT RESPONSE STREAM] session=%s: Initiated LLM-to-TTS sentence streaming.", self._session_id)
+            if candidate_text is not None:
+                orig_stream = text
 
-        handle = self.session.say(text)
+                async def _wrapping_stream() -> AsyncIterable[str]:
+                    async for chunk in orig_stream:
+                        yield chunk
+                    full_gen = full_generated_text_container[0] if full_generated_text_container else ""
+                    summary_before = self._memory.rolling_summary
+                    self._memory.add_turn(candidate_text, full_gen)
+                    summary_updated = self._memory.rolling_summary != summary_before
+                    logger.info(
+                        "[TURN LOG] session=%s summary_updated=%s candidate=%r reply=%r",
+                        self._session_id,
+                        summary_updated,
+                        candidate_text,
+                        full_gen,
+                    )
+
+                say_target = _wrapping_stream()
+            else:
+                say_target = text
+
+        handle = self.session.say(say_target)
         self._current_speech_handle = handle
 
         committed = False
@@ -1256,19 +1303,6 @@ class InterviewAgent(Agent):
                 )
             else:
                 logger.info("[SPEECH COMPLETED] session=%s: Full reply delivered (%d chars)", self._session_id, len(actually_spoken))
-
-            if candidate_text is not None:
-                summary_before = self._memory.rolling_summary
-                self._memory.add_turn(candidate_text, actually_spoken)
-                summary_updated = self._memory.rolling_summary != summary_before
-                logger.info(
-                    "[TURN LOG] session=%s summary_updated=%s candidate=%r reply=%r interrupted=%s",
-                    self._session_id,
-                    summary_updated,
-                    candidate_text,
-                    actually_spoken,
-                    h.interrupted,
-                )
 
         handle.add_done_callback(_on_speech_done)
         return handle
@@ -1422,7 +1456,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             seen.add(t)
             unique_terms.append(t)
     stt_prompt = (
-        f"This is a technical software engineering interview with {candidate_name} for a {job_role} role. "
+        f"This is a technical engineering interview with {candidate_name} for a {job_role} role. "
         f"Technical terms that may appear: {', '.join(unique_terms[:40])}."
     )
     logger.info("[STT] Whisper prompt built (%d chars): %r", len(stt_prompt), stt_prompt[:120])
