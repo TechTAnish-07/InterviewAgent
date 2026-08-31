@@ -20,8 +20,8 @@ env/
 # Testing / Cache
 .pytest_cache/
 .coverage
-test_*.py
-tests/
 
 # Local Conversation Logs
 conversations/
+voice-agent/conversations/*
+!voice-agent/conversations/.gitkeep

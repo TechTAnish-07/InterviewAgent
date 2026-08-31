@@ -34,7 +34,7 @@ services:
     name: interview-agent-worker
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python agent.py start
+    startCommand: python voice-agent/agent.py start
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

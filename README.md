@@ -6,10 +6,10 @@ A standalone Python microservice and full-duplex conversational voice agent powe
 
 ## 🚀 Overview & Key Features
 
-1. **LiveKit AI Voice Agent Worker (`agent.py`)** — Real-time voice interviewer with low-latency VAD, STT, LLM reasoning, Function Tool calling, and TTS.
+1. **LiveKit AI Voice Agent Worker (`voice-agent/agent.py`)** — Real-time voice interviewer with low-latency VAD, STT, LLM reasoning, Function Tool calling, and TTS.
 2. **FastAPI Microservice (`app/`)** — Resume normalization (PDF text reconstruction), pre-flight job relevance screening, and explicit agent dispatching via LiveKit API.
-3. **Bounded Working Memory (`memory.py`)** — Maintains a sliding window of recent turn pairs and folds older turns into a rolling summary to manage context size efficiently.
-4. **Safety & Moderation (`moderation.py`)** — Fast local heuristics and LLM fallback to detect off-topic or inappropriate responses, with soft warning escalation and policy termination.
+3. **Bounded Working Memory (`voice-agent/memory.py`)** — Maintains a sliding window of recent turn pairs and folds older turns into a rolling summary to manage context size efficiently.
+4. **Safety & Moderation (`voice-agent/moderation.py`)** — Fast local heuristics and LLM fallback to detect off-topic or inappropriate responses, with soft warning escalation and policy termination.
 5. **Automated Evaluation Reporting** — Generates objective post-interview candidate feedback reports and posts them to the Spring Boot backend (`POST /api/ai-interview/{sessionId}/feedback`).
 
 ---
@@ -57,16 +57,17 @@ flowchart TD
 ```mermaid
 graph TD
     Client[Web Frontend / Candidate] <-->|WebRTC Voice| LiveKit[LiveKit Server]
-    LiveKit <-->|Agent Dispatch & Worker API| AgentWorker[agent.py - LiveKit Worker]
+    LiveKit <-->|Agent Dispatch & Worker API| AgentWorker[voice-agent/agent.py - LiveKit Worker]
     
     Spring[Spring Boot Backend] <-->|REST API Context & Feedback| AgentWorker
     Spring <-->|REST Dispatch & Resume API| FastAPI[app/main.py - FastAPI Server]
     
     subgraph Agent Core Components
-        AgentWorker --> Memory[memory.py - Bounded Working Memory]
-        AgentWorker --> Moderation[moderation.py - Safety Classifier]
-        AgentWorker --> Prompts[prompts.py - System Prompts]
-        AgentWorker --> Tools[tools.py - Function Tools]
+        AgentWorker --> Memory[voice-agent/memory.py - Bounded Working Memory]
+        AgentWorker --> Moderation[voice-agent/moderation.py - Safety Classifier]
+        AgentWorker --> Prompts[voice-agent/prompts.py - System Prompts]
+        AgentWorker --> Tools[voice-agent/tools.py - Function Tools]
+        AgentWorker --> Questions[voice-agent/questions.py - Question Bank]
     end
     
     subgraph External LLM & Voice Services
@@ -81,24 +82,39 @@ graph TD
 
 ```
 InterviewAgent/
-├── app/
-│   ├── controllers/          # FastAPI Router Endpoints
-│   │   ├── health_controller.py      # Health Check Endpoint
-│   │   ├── resume_controller.py      # Resume Normalization & Relevance Endpoints
-│   │   └── dispatch_controller.py    # LiveKit Agent Dispatch Endpoint
-│   ├── schemas/              # Pydantic Request & Response Schemas
+├── voice-agent/                    # LiveKit real-time voice interview agent
+│   ├── agent.py                    # Worker entrypoint & session lifecycle
+│   ├── memory.py                   # Bounded working memory & rolling summarization
+│   ├── moderation.py               # Local heuristic & LLM content moderation
+│   ├── prompts.py                  # System prompts & feedback generation templates
+│   ├── questions.py                # Static coding problem bank & prompts
+│   ├── tools.py                    # LiveKit function tool definitions (@llm.function_tool)
+│   ├── tests/                      # Voice agent & API test suite
+│   │   ├── test_coding_tools.py    # Coding tool tests
+│   │   ├── test_interruption.py    # Interruption & speech handle tests
+│   │   ├── test_main.py            # FastAPI microservice endpoint tests
+│   │   ├── test_memory.py          # Memory sliding window & fold tests
+│   │   ├── test_ollama.py          # Local model integration tests
+│   │   └── test_time_limits.py     # Time limit watchdog tests
+│   └── conversations/              # Runtime local conversation JSON logs (gitignored)
+├── app/                            # FastAPI microservice (resume processing & dispatch)
+│   ├── controllers/                # FastAPI Router Endpoints
+│   │   ├── health_controller.py    # Health check endpoint
+│   │   ├── resume_controller.py    # Resume normalization & relevance endpoints
+│   │   └── dispatch_controller.py  # LiveKit agent dispatch endpoint
+│   ├── schemas/                    # Pydantic request & response schemas
 │   │   └── resume_schema.py
-│   ├── services/             # Resume Normalization & Relevance Service
+│   ├── services/                   # Resume normalization & relevance service
 │   │   └── resume_service.py
-│   ├── config.py             # App Configuration & Environment Bindings
-│   └── main.py               # FastAPI Microservice Entrypoint
-├── agent.py                  # LiveKit Voice Agent Worker & Session Lifecycle
-├── memory.py                 # Bounded Working Memory & Direct Turn Folding
-├── moderation.py             # Local Heuristic & LLM Content Moderation
-├── prompts.py                # System Prompts & Feedback Generation Templates
-├── tools.py                  # LiveKit Function Tool Definitions (@llm.function_tool)
-├── test_main.py              # Pytest Test Suite
-├── requirements.txt          # Python Dependencies
+│   ├── config.py                   # App configuration & environment bindings
+│   └── main.py                     # FastAPI microservice entrypoint
+├── conftest.py                     # Pytest path configuration
+├── pyrightconfig.json              # Pyright / IDE configuration
+├── requirements.txt                # Python dependencies
+├── start.sh                        # Dual-service container startup script
+├── Dockerfile                      # Docker build definition
+├── Procfile                        # Process manager file
+├── render.yaml                     # Render deployment specification
 └── README.md
 ```
 
@@ -143,7 +159,7 @@ uvicorn app.main:app --reload --port 8000
 
 #### LiveKit Voice Agent Worker
 ```bash
-python agent.py dev
+python voice-agent/agent.py dev
 ```
 
 ---

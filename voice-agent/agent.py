@@ -2,9 +2,16 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterable
+
+# Ensure voice-agent directory is in sys.path
+_CURRENT_DIR = Path(__file__).resolve().parent
+if str(_CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_CURRENT_DIR))
 
 import numpy as np
 
