@@ -142,7 +142,7 @@ class ConversationMemory:
         except RuntimeError:
             logger.debug("No running event loop for background fold task; will fold on next flush.")
 
-    async def trigger_background_fold(self, reason: str = "batch_size_reached") -> None:
+    async def trigger_background_fold(self, reason: str = "batch_size_reached", retry_count: int = 0) -> None:
         """
         Non-blocking background task to summarize accumulated pending_fold_buffer pairs using Groq.
         Guarded against overlapping executions using _is_folding flag and asyncio.Lock.
@@ -163,19 +163,19 @@ class ConversationMemory:
         async with self._fold_lock:
             self._is_folding = True
             try:
-                await self._execute_batch_fold(reason=reason)
+                await self._execute_batch_fold(reason=reason, retry_count=retry_count)
             finally:
                 self._is_folding = False
 
-    async def _execute_batch_fold(self, reason: str = "batch_size_reached") -> None:
+    async def _execute_batch_fold(self, reason: str = "batch_size_reached", retry_count: int = 0) -> None:
         """
         Summarize all pending turn pairs in pending_fold_buffer in a single Groq call.
+        Retains pending turns in buffer until fold succeeds to avoid context gaps.
         """
         if not self.pending_fold_buffer:
             return
 
         batch_to_fold = self.pending_fold_buffer[:]
-        self.pending_fold_buffer = []
 
         exchanges = []
         for candidate_text, agent_text in batch_to_fold:
@@ -212,6 +212,8 @@ class ConversationMemory:
             if summary:
                 self.summary_bullets.append(summary)
                 self._rebuild_rolling_summary()
+                # Remove folded batch from pending_fold_buffer now that summary is updated
+                self.pending_fold_buffer = self.pending_fold_buffer[len(batch_to_fold):]
                 logger.info(
                     "[MEMORY FOLD COMPLETED] session=%s reason=%s duration=%.2fms model=%s (Groq confirmed) "
                     "summarized_%d_pairs summary_bullets=%d",
@@ -226,15 +228,37 @@ class ConversationMemory:
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             logger.warning(
-                "[MEMORY FOLD FAILED] session=%s reason=%s duration=%.2fms model=%s error: %s. Restoring to buffer.",
+                "[MEMORY FOLD FAILED] session=%s reason=%s retry=%d duration=%.2fms model=%s error: %s. Turns retained in buffer.",
                 self.session_id,
                 reason,
+                retry_count,
                 elapsed_ms,
                 self.summarization_model,
                 e,
             )
-            # Re-queue failed batch back into pending_fold_buffer
-            self.pending_fold_buffer = batch_to_fold + self.pending_fold_buffer
+            # Automatic retry with exponential backoff up to 3 times
+            MAX_RETRIES = 3
+            if retry_count < MAX_RETRIES:
+                backoff_delay = 1.5 * (2 ** retry_count)
+                logger.info(
+                    "[MEMORY FOLD RETRY] Scheduling fold retry %d/%d in %.1fs for session %s",
+                    retry_count + 1,
+                    MAX_RETRIES,
+                    backoff_delay,
+                    self.session_id,
+                )
+                async def _delayed_retry():
+                    await asyncio.sleep(backoff_delay)
+                    await self.trigger_background_fold(
+                        reason=f"{reason}_retry_{retry_count + 1}",
+                        retry_count=retry_count + 1,
+                    )
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_delayed_retry())
+                except RuntimeError:
+                    pass
 
     async def flush_pending_folds(self) -> None:
         """
@@ -256,19 +280,19 @@ class ConversationMemory:
         else:
             self.rolling_summary = ""
 
-    def build_context_messages(self) -> list[dict[str, str]]:
+    def build_context_messages(self, include_summary_system_msg: bool = False) -> list[dict[str, str]]:
         """
         Build message dicts for LLM completion calls:
-        - System context message with rolling summary (if non-empty)
-        - Followed by full recent_turns (sliding window of last 10 turns) in chronological order
+        - Optional system context message with rolling summary (if include_summary_system_msg=True and rolling_summary is non-empty)
+        - Followed by pending_fold_buffer (unsummarized evicted turns) and recent_turns in chronological order
         """
         messages: list[dict[str, str]] = []
 
-        if self.rolling_summary:
+        if include_summary_system_msg and self.rolling_summary:
             summary_msg = f"Prior Conversation Summary:\n{self.rolling_summary}"
             messages.append({"role": "system", "content": summary_msg})
 
-        for candidate_text, agent_text in self.recent_turns:
+        for candidate_text, agent_text in (self.pending_fold_buffer + self.recent_turns):
             if candidate_text:
                 messages.append({"role": "user", "content": candidate_text})
             if agent_text:
