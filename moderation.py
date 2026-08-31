@@ -27,7 +27,7 @@ INAPPROPRIATE_TRIGGERS = {
 }
 
 
-def check_message_relevance(
+async def check_message_relevance(
     latest_message: str,
     recent_turns: list | None = None,
     model_name: str | None = None,
@@ -73,7 +73,7 @@ def check_message_relevance(
         if api_key:
             completion_kwargs["api_key"] = api_key
 
-        response = litellm.completion(**completion_kwargs)
+        response = await litellm.acompletion(**completion_kwargs)
         raw_content = response.choices[0].message.content or ""
         classification = raw_content.strip().upper()
 
