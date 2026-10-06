@@ -8,16 +8,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterable
 
-# Ensure voice-agent directory is in sys.path
+# Ensure voice-agent directory and project root are in sys.path
 _CURRENT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _CURRENT_DIR.parent
 if str(_CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(_CURRENT_DIR))
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 
 import aiohttp
 import litellm
 from dotenv import load_dotenv
+
+from app.schemas.evaluation_schema import (
+    CompetencyScores,
+    InterviewEvaluationResult,
+    TopicAssessment,
+)
+from app.services.storage_service import storage_service
 
 from livekit import agents, api, rtc
 from livekit.agents import Agent, AgentSession, InterruptionOptions, ModelSettings, TurnHandlingOptions, inference
@@ -375,7 +385,114 @@ def handle_transcript(session_id: str, transcript_text: str) -> None:
     logger.info("[STT TRANSCRIPT] session=%s: %s", session_id, transcript_text)
 
 
-async def send_feedback_report(session_id: str, feedback_text: str) -> bool:
+def _parse_feedback_response(
+    raw_text: str,
+    candidate_name: str,
+    job_role: str,
+    session_id: str,
+    user_id: str,
+) -> tuple[InterviewEvaluationResult, str]:
+    """
+    Safely parse LLM feedback generation output into an InterviewEvaluationResult.
+    Handles Markdown-wrapped JSON (```json ... ```), raw JSON, or unstructured Markdown fallback.
+    """
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+
+    try:
+        data = json.loads(cleaned)
+        overall_score = float(data.get("overall_score", 7.0))
+        comp_dict = data.get("competencies", {})
+        competencies = CompetencyScores(
+            technical_depth=float(comp_dict.get("technical_depth", 7.0)),
+            problem_solving=float(comp_dict.get("problem_solving", 7.0)),
+            communication=float(comp_dict.get("communication", 7.0)),
+            code_quality=float(comp_dict["code_quality"]) if comp_dict.get("code_quality") is not None else None,
+        )
+
+        strong_topics = []
+        for t in data.get("strong_topics", []):
+            if isinstance(t, dict) and t.get("topic"):
+                strong_topics.append(TopicAssessment(
+                    topic=str(t["topic"]).strip(),
+                    category=str(t.get("category", "Technical")),
+                    score=float(t.get("score", 8.0)),
+                    status="strong",
+                    evidence=str(t.get("evidence", "")),
+                    recommendation=t.get("recommendation"),
+                ))
+
+        weak_topics = []
+        for t in data.get("weak_topics", []):
+            if isinstance(t, dict) and t.get("topic"):
+                weak_topics.append(TopicAssessment(
+                    topic=str(t["topic"]).strip(),
+                    category=str(t.get("category", "Technical")),
+                    score=float(t.get("score", 5.0)),
+                    status="weak",
+                    evidence=str(t.get("evidence", "")),
+                    recommendation=str(t.get("recommendation", "")),
+                ))
+
+        all_topics = []
+        for t in data.get("all_topics", []):
+            if isinstance(t, dict) and t.get("topic"):
+                all_topics.append(TopicAssessment(
+                    topic=str(t["topic"]).strip(),
+                    category=str(t.get("category", "Technical")),
+                    score=float(t.get("score", 6.0)),
+                    status=str(t.get("status", "moderate")),
+                    evidence=str(t.get("evidence", "")),
+                    recommendation=t.get("recommendation"),
+                ))
+
+        if not all_topics:
+            all_topics = strong_topics + weak_topics
+
+        overview = str(data.get("overview", ""))
+        markdown_feedback = str(data.get("markdown_feedback", raw_text))
+
+        eval_result = InterviewEvaluationResult(
+            session_id=session_id,
+            user_id=user_id,
+            candidate_name=candidate_name,
+            job_role=job_role,
+            overall_score=overall_score,
+            strong_topics=strong_topics,
+            weak_topics=weak_topics,
+            all_topics=all_topics,
+            competencies=competencies,
+            overview=overview,
+            markdown_feedback=markdown_feedback,
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return eval_result, markdown_feedback
+    except Exception as e:
+        logger.warning("Could not parse structured JSON feedback (falling back to markdown): %s", e)
+        eval_result = InterviewEvaluationResult(
+            session_id=session_id,
+            user_id=user_id,
+            candidate_name=candidate_name,
+            job_role=job_role,
+            overall_score=7.0,
+            strong_topics=[],
+            weak_topics=[],
+            all_topics=[],
+            competencies=CompetencyScores(),
+            overview="Post-interview evaluation report.",
+            markdown_feedback=raw_text,
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return eval_result, raw_text
+
+
+async def send_feedback_report(session_id: str, feedback_payload: dict | str) -> bool:
     """
     POST feedback report to Spring Boot backend:
     POST {SPRING_BASE_URL}/api/ai-interview/{sessionId}/feedback
@@ -385,7 +502,7 @@ async def send_feedback_report(session_id: str, feedback_text: str) -> bool:
         "X-Internal-Api-Key": INTERNAL_API_KEY,
         "Content-Type": "application/json",
     }
-    payload = {"feedback": feedback_text}
+    payload = feedback_payload if isinstance(feedback_payload, dict) else {"feedback": feedback_payload}
 
     try:
         async with aiohttp.ClientSession() as http:
@@ -433,7 +550,8 @@ async def generate_and_save_feedback(
     reason: str
 ) -> None:
     """
-    Generate post-interview feedback report using Gemini via LiteLLM and POST it to Spring Boot.
+    Generate post-interview feedback report with structured topic evaluation using Gemini via LiteLLM.
+    Persists evaluation to SQLite storage service and POSTs it to Spring Boot.
     Skips generation if policy_violation with minimal conversation.
     """
     if reason == "policy_violation" and (not memory or (not memory.recent_turns and not memory.rolling_summary)):
@@ -444,6 +562,7 @@ async def generate_and_save_feedback(
         await memory.flush_pending_folds()
 
     candidate_name = (context.get("candidateName") if context else None) or "Candidate"
+    user_id = (context.get("userId") or context.get("user_id") if context else None) or "anonymous"
     job_role = (context.get("jobTitle") or context.get("jobRole") if context else None) or "Software Engineer"
     resume_text = (context.get("resumeText") if context else None) or "Not provided"
     full_conversation = memory.get_full_context_text() if memory else "No turns recorded."
@@ -456,7 +575,14 @@ async def generate_and_save_feedback(
     )
 
     messages = [
-        {"role": "system", "content": "You are an expert technical interviewer. Write detailed, structured, honest, and actionable post-interview feedback reports. Always use the exact section headers requested. Be specific — reference what the candidate actually said."},
+        {
+            "role": "system",
+            "content": (
+                "You are an expert technical interviewer and hiring committee evaluator. "
+                "Analyze candidate responses, identify their strongest and weakest technical topics with concrete evidence, "
+                "grade their competencies, and provide a comprehensive feedback report. Return valid JSON."
+            ),
+        },
         {"role": "user", "content": prompt},
     ]
 
@@ -468,17 +594,56 @@ async def generate_and_save_feedback(
         comp_kwargs = {
             "model": model_to_use,
             "messages": messages,
-            "temperature": 0.4,
-            "max_tokens": 1200,
+            "temperature": 0.3,
+            "max_tokens": 2000,
         }
         if custom_api_key:
             comp_kwargs["api_key"] = custom_api_key
 
         response = await litellm.acompletion(**comp_kwargs)
         log_llm_cost("FEEDBACK_GEN", model_to_use, response)
-        feedback_text = response.choices[0].message.content.strip()
-        logger.info("Feedback report generated for session %s. Saving to Spring Boot...", session_id)
-        await send_feedback_report(session_id, feedback_text)
+        raw_feedback_text = response.choices[0].message.content.strip()
+
+        # Parse structured evaluation and markdown
+        eval_result, markdown_feedback = _parse_feedback_response(
+            raw_text=raw_feedback_text,
+            candidate_name=candidate_name,
+            job_role=job_role,
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+        # Save to local SQLite storage & update topic mastery
+        try:
+            storage_service.save_evaluation(eval_result)
+            logger.info(
+                "Persisted evaluation to SQLite for session %s (user: %s). Strong: %d, Weak: %d",
+                session_id, user_id, len(eval_result.strong_topics), len(eval_result.weak_topics)
+            )
+        except Exception as storage_err:
+            logger.error("Failed to save evaluation to SQLite storage: %s", storage_err)
+
+        # Save local JSON artifact in conversations directory
+        try:
+            eval_file_path = CONVERSATIONS_DIR / f"{session_id}_evaluation.json"
+            with open(eval_file_path, "w", encoding="utf-8") as f:
+                json.dump(eval_result.model_dump(), f, indent=2, ensure_ascii=False)
+            logger.info("Saved local evaluation JSON to %s", eval_file_path)
+        except Exception as file_err:
+            logger.warning("Could not write evaluation JSON to file: %s", file_err)
+
+        # Send structured payload to Spring Boot
+        feedback_payload = {
+            "feedback": markdown_feedback,
+            "overallScore": eval_result.overall_score,
+            "strongTopics": [t.model_dump() for t in eval_result.strong_topics],
+            "weakTopics": [t.model_dump() for t in eval_result.weak_topics],
+            "allTopics": [t.model_dump() for t in eval_result.all_topics],
+            "competencies": eval_result.competencies.model_dump(),
+            "userId": user_id,
+        }
+        logger.info("Saving feedback report to Spring Boot for session %s...", session_id)
+        await send_feedback_report(session_id, feedback_payload)
     except Exception as e:
         logger.error("Error generating feedback report for session %s: %s", session_id, e)
 
@@ -1380,6 +1545,18 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         extra_context += f"\n\nCandidate Executive Summary: {summary}"
     if skills and skills != "[]":
         extra_context += f"\nVerified Technical Skills: {skills}"
+
+    past_weak_topics = context.get("pastWeakTopics") or context.get("past_weak_topics") if context else None
+    if past_weak_topics:
+        if isinstance(past_weak_topics, list):
+            weak_str = ", ".join(str(w) for w in past_weak_topics if str(w).strip())
+        else:
+            weak_str = str(past_weak_topics).strip()
+        if weak_str:
+            extra_context += (
+                f"\n\nCandidate Prior Focus Areas: In previous interviews, candidate struggled with: [{weak_str}]. "
+                f"During technical questioning, naturally probe these topics to verify if they have improved."
+            )
 
     # Format system prompt from SYSTEM_PROMPT_TEMPLATE + question bank
     # Appending the hardcoded question bank means the LLM always picks from a

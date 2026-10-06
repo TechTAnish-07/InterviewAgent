@@ -51,6 +51,16 @@ async def dispatch_agent(request: Request):
     else:
         resolved_model = None
 
+    user_id = data.get("user_id") or data.get("userId")
+    past_weak_topics = data.get("past_weak_topics") or data.get("pastWeakTopics")
+    if not past_weak_topics and user_id:
+        try:
+            from app.services.storage_service import storage_service
+            past_weak_topics = storage_service.get_user_weak_topics_for_interview(str(user_id).strip())
+        except Exception as e:
+            logger.warning("Could not fetch weak topics for user %s: %s", user_id, e)
+            past_weak_topics = []
+
     meta_dict = {
         "sessionId": target_session_id,
         "candidateName": data.get("candidate_name") or data.get("candidateName") or "Candidate",
@@ -60,6 +70,10 @@ async def dispatch_agent(request: Request):
         "resumeText": data.get("resume_text") or data.get("resumeText") or "",
         "durationMinutes": data.get("duration_minutes") or data.get("durationMinutes") or data.get("max_interview_minutes") or data.get("maxInterviewMinutes"),
     }
+    if user_id:
+        meta_dict["userId"] = str(user_id).strip()
+    if past_weak_topics:
+        meta_dict["pastWeakTopics"] = past_weak_topics
     if custom_api_key:
         meta_dict["apiKey"] = str(custom_api_key).strip()
     if provider:

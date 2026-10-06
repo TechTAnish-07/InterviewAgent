@@ -21,7 +21,9 @@ env/
 .pytest_cache/
 .coverage
 
-# Local Conversation Logs
+# Local Conversation Logs & Database
 conversations/
 voice-agent/conversations/*
 !voice-agent/conversations/.gitkeep
+data/
+*.db

@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from app.controllers import health_controller, resume_controller, dispatch_controller
+from app.controllers import health_controller, resume_controller, dispatch_controller, analytics_controller
 
 logger = logging.getLogger("uvicorn")
 
@@ -28,3 +28,4 @@ app = FastAPI(
 app.include_router(health_controller.router)
 app.include_router(resume_controller.router)
 app.include_router(dispatch_controller.router)
+app.include_router(analytics_controller.router)

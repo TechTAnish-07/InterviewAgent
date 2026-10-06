@@ -178,4 +178,8 @@ pytest
 - **POST `/resume/normalize`**: Reconstruct scrambled PDF text into structured Markdown
 - **POST `/resume/check-relevance`**: Check candidate resume fit against target job title
 - **POST `/dispatch-agent`**: Dispatch agent worker to a LiveKit room
+- **POST `/analytics/evaluations`**: Store interview evaluation and update candidate topic mastery
+- **GET `/analytics/evaluations/{sessionId}`**: Retrieve detailed evaluation record for a session
+- **GET `/analytics/users/{userId}`**: Retrieve candidate analytics (top strengths, top weaknesses, mastery levels, averages)
+- **GET `/analytics/users/{userId}/weak-topics`**: Get candidate's top weak topics to adapt future interview sessions
 - **Interactive Swagger Docs**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)

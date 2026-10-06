@@ -98,15 +98,10 @@ harsh. Then wait for their response as normal.
 """
 
 FEEDBACK_GENERATION_PROMPT = """
-You are writing a detailed, constructive feedback report for a candidate after a
-mock interview. This report is the main value the candidate takes away from this
-session, so it must be specific and genuinely useful for improvement — not generic
-praise or vague criticism.
+You are writing a detailed, constructive feedback report and topic performance analysis for a candidate after a mock interview.
+This report is the main value the candidate takes away from this session, so it must be specific and genuinely useful for improvement.
 
-IMPORTANT: The candidate's name is exactly "{candidate_name}" — use this exact name
-as given. Do not alter, guess, or substitute a different name even if a different
-name came up during the conversation for any reason.
-
+IMPORTANT: The candidate's name is exactly "{candidate_name}" — use this exact name as given.
 Job role: {job_role}
 Resume summary:
 {resume_text}
@@ -114,49 +109,60 @@ Resume summary:
 Full conversation record:
 {full_conversation_context}
 
-Write the report in markdown with these exact sections, in this order:
+You MUST return a single valid JSON object with the following schema:
+{
+  "overall_score": 7.5,
+  "competencies": {
+    "technical_depth": 7.0,
+    "problem_solving": 8.0,
+    "communication": 7.5,
+    "code_quality": 8.0
+  },
+  "strong_topics": [
+    {
+      "topic": "System Design: Caching & Redis",
+      "category": "System Design",
+      "score": 8.5,
+      "status": "strong",
+      "evidence": "Accurately explained cache invalidation strategies and cache-aside pattern."
+    }
+  ],
+  "weak_topics": [
+    {
+      "topic": "SQL Query Optimization & Indexing",
+      "category": "Database & Storage",
+      "score": 4.5,
+      "status": "weak",
+      "evidence": "Could not explain composite index ordering or B-tree vs Hash index trade-offs.",
+      "recommendation": "Review PostgreSQL EXPLAIN ANALYZE and composite B-tree index principles."
+    }
+  ],
+  "all_topics": [
+    {
+      "topic": "System Design: Caching & Redis",
+      "category": "System Design",
+      "score": 8.5,
+      "status": "strong",
+      "evidence": "Accurately explained cache invalidation strategies and cache-aside pattern."
+    },
+    {
+      "topic": "SQL Query Optimization & Indexing",
+      "category": "Database & Storage",
+      "score": 4.5,
+      "status": "weak",
+      "evidence": "Could not explain composite index ordering or B-tree vs Hash index trade-offs.",
+      "recommendation": "Review PostgreSQL EXPLAIN ANALYZE and composite B-tree index principles."
+    }
+  ],
+  "overview": "2-3 sentences summarizing overall impression and how the interview went.",
+  "markdown_feedback": "Full markdown report using standard headers: ## Overview\\n\\n...\\n\\n## Strengths\\n\\n...\\n\\n## Areas to Improve\\n\\n...\\n\\n## Resume-Answer Consistency\\n\\n...\\n\\n## Coding Round\\n\\n...\\n\\n## Communication and Delivery\\n\\n...\\n\\n## Recommended Next Steps\\n\\n..."
+}
 
-## Overview
-2-3 sentences summarizing overall impression and how the interview went.
-
-## Strengths
-Specific things the candidate did well, each backed by a concrete reference to
-something they actually said or did in the conversation — not generic praise like
-"good communication skills" without an example attached.
-
-## Areas to Improve
-Specific gaps or weak points, each with a concrete example from the conversation
-and, where possible, a brief explanation of what a stronger answer would have
-included.
-
-## Resume-Answer Consistency
-Note any areas where the resume claimed specific experience, skills, or seniority
-that wasn't clearly demonstrated in the candidate's answers, or where answers seemed
-inconsistent with what the resume states. Be factual and specific, not accusatory.
-Only include this section with real content if there's a genuine, clear gap — if
-answers reasonably supported the resume, say so briefly instead of manufacturing a
-discrepancy.
-
-## Coding Round
-If a coding exercise occurred, assess the candidate's approach, correctness,
-consideration of edge cases, and code quality/efficiency, referencing what actually
-happened (their own test results if they ran the code, or your own check if you ran
-it). If no coding round occurred, omit this section entirely.
-
-## Communication and Delivery
-Assess clarity, structure of answers, and how well the candidate explained their
-thinking out loud — this is a voice interview, so communication under live
-conditions matters as its own dimension.
-
-## Recommended Next Steps
-3-5 concrete, actionable suggestions the candidate can act on before their next
-interview — specific enough to actually follow (e.g. "practice explaining time
-complexity out loud for your solutions" rather than "improve technical knowledge").
-
-Write naturally and specifically — reference actual moments from the conversation
-throughout, not just in the strengths/weaknesses sections. Aim for genuine depth,
-not padding — a longer report should come from more specific detail, not repetition
-or filler.
+CRITICAL RULES:
+1. Ensure the JSON is valid and properly escaped.
+2. Under "strong_topics", extract 1-4 specific technical or problem-solving topics where candidate scored >= 7.0 with concrete evidence.
+3. Under "weak_topics", extract 1-4 specific technical or problem-solving topics where candidate scored <= 6.0 with concrete evidence and actionable recommendations.
+4. Under "markdown_feedback", write the full, comprehensive Markdown feedback report with all sections (Overview, Strengths, Areas to Improve, Resume-Answer Consistency, Coding Round, Communication and Delivery, Recommended Next Steps).
 """
 
 # ---------------------------------------------------------------------------
