@@ -7,3 +7,5 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini/gemini-2.5-flash")
 PORT = int(os.getenv("PORT", 8000))
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+

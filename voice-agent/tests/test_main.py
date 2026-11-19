@@ -268,6 +268,26 @@ def test_dispatch_agent_with_custom_api_key_and_provider(mock_livekit_api):
     assert meta["modelName"] == "groq/llama-3.3-70b-versatile"
 
 
+def test_dispatch_agent_unauthorized():
+    unauthed_client = TestClient(app)
+    # Missing header
+    res1 = unauthed_client.post(
+        "/dispatch-agent",
+        json={"room": "test_room", "session_id": "test_sess"},
+    )
+    assert res1.status_code == 401
+    assert "Unauthorized" in res1.json()["detail"]
+
+    # Wrong header
+    res2 = unauthed_client.post(
+        "/dispatch-agent",
+        json={"room": "test_room", "session_id": "test_sess"},
+        headers={"X-Internal-Api-Key": "wrong-key"},
+    )
+    assert res2.status_code == 401
+    assert "Unauthorized" in res2.json()["detail"]
+
+
 def test_agent_extract_context_from_metadata():
     import json
     from agent import extract_context_from_metadata

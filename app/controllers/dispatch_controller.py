@@ -3,6 +3,7 @@ import logging
 import os
 from fastapi import APIRouter, HTTPException, Request
 from livekit import api
+from app.config import INTERNAL_API_KEY
 
 logger = logging.getLogger("dispatch-controller")
 
@@ -13,8 +14,19 @@ router = APIRouter(tags=["Dispatch"])
 async def dispatch_agent(request: Request):
     """
     Dispatch the 'interview-agent' LiveKit worker to a specific room.
+    Validates X-Internal-Api-Key header to ensure only authorized backend calls can trigger a dispatch.
     Reads request body directly to prevent 422 validation errors.
     """
+    expected_key = INTERNAL_API_KEY or os.getenv("INTERNAL_API_KEY")
+    if expected_key:
+        api_key_header = request.headers.get("X-Internal-Api-Key") or request.headers.get("x-internal-api-key")
+        if not api_key_header or api_key_header.strip() != expected_key.strip():
+            logger.warning("Unauthorized dispatch request: missing or invalid X-Internal-Api-Key")
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized: Missing or invalid X-Internal-Api-Key header",
+            )
+
     try:
         body_bytes = await request.body()
         if not body_bytes:
